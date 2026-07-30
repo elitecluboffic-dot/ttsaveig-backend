@@ -8,7 +8,6 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "btch-downloader": "^2.4.0",
     "hono": "^4.6.0"
   },
   "devDependencies": {
