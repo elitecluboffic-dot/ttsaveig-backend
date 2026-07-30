@@ -9,9 +9,7 @@
   },
   "dependencies": {
     "btch-downloader": "^2.4.0",
-    "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "express-rate-limit": "^7.4.0"
+    "hono": "^4.6.0"
   },
   "devDependencies": {
     "wrangler": "^4.28.0"
