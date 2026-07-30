@@ -1,98 +1,104 @@
-import { httpServerHandler } from 'cloudflare:node';
-import express from 'express';
-import cors from 'cors';
-import rateLimit from 'express-rate-limit';
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
 import { ttdl, igdl } from 'btch-downloader';
 
 /* =========================================================
-   TTSAVEIG BACKEND — versi Cloudflare Workers
+   TTSAVEIG BACKEND — versi Cloudflare Workers (Hono)
    Project terpisah dari frontend (frontend ada di Worker lain,
    folder ttsaveig/, di telehub.web.id/ttsaveig).
 
-   Beda dari versi Node.js/Railway biasa:
-   - Tidak pakai app.listen(PORT) + dotenv seperti server biasa.
-     Di Workers, port di app.listen() cuma dipakai secara internal
-     oleh httpServerHandler, tidak benar-benar "membuka port" ke
-     luar seperti di VPS.
-   - Environment variable (ALLOWED_ORIGIN) diatur lewat "vars" di
-     wrangler.jsonc / `wrangler secret put`, BUKAN file .env — dan
-     otomatis muncul di process.env berkat nodejs_compat.
-   - WAJIB compatibility_date 2025-08-15 atau lebih baru, dan
-     compatibility_flags: ["nodejs_compat"] di wrangler.jsonc.
+   Kenapa pindah dari Express ke Hono:
+   - Express (lib/express.js) melakukan require('body-parser') di
+     level teratas modul, walaupun kita tidak pernah memanggil
+     express.json(). body-parser -> raw-body -> iconv-lite, dan
+     iconv-lite memanggil require_streams(...) dari polyfill
+     node:stream milik nodejs_compat, yang belum didukung penuh oleh
+     Cloudflare Workers (error saat deploy: "require_streams(...) is
+     not a function"). Middleware manual pun tidak menolong karena
+     masalahnya ada di import express itu sendiri, bukan di
+     middleware-nya.
+   - Hono dibangun khusus untuk runtime Workers/edge, tidak menyentuh
+     node:stream, iconv-lite, atau body-parser sama sekali. Tidak
+     perlu httpServerHandler / cloudflare:node / app.listen() lagi —
+     Hono langsung export default { fetch }.
+
+   Environment variable (ALLOWED_ORIGIN) tetap diatur lewat "vars" di
+   wrangler.jsonc / `wrangler secret put`, dan diakses lewat c.env,
+   BUKAN process.env (di Hono, env per-request lewat context, lebih
+   idiomatis untuk Workers dibanding process.env ala Node).
 ========================================================= */
 
-const app = express();
+const app = new Hono();
 
-const allowedOrigins = (process.env.ALLOWED_ORIGIN || '')
-  .split(',')
-  .map((o) => o.trim())
-  .filter(Boolean);
+// ---------- CORS ----------
+// origin di-resolve per-request supaya bisa baca c.env.ALLOWED_ORIGIN
+app.use('*', async (c, next) => {
+  const allowedOrigins = (c.env.ALLOWED_ORIGIN || '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
 
-app.use(
-  cors({
-    origin(origin, callback) {
+  const corsMiddleware = cors({
+    origin: (origin) => {
       if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
-        return callback(null, true);
+        return origin || '*';
       }
-      callback(new Error('Origin tidak diizinkan oleh CORS'));
+      return null; // ditolak
     },
-  })
-);
-
-// PENTING: sengaja TIDAK pakai express.json() bawaan.
-// express.json() -> body-parser -> raw-body -> iconv-lite, dan iconv-lite
-// memakai modul node:stream dengan cara yang belum didukung penuh oleh
-// polyfill nodejs_compat di Cloudflare Workers (error saat deploy:
-// "require_streams(...) is not a function"). Middleware manual di bawah
-// ini melakukan hal yang sama (baca body, parse JSON) tanpa dependency
-// yang bermasalah tersebut.
-function parseJsonBody(req, res, next) {
-  if (req.method !== 'POST' && req.method !== 'PUT' && req.method !== 'PATCH') {
-    return next();
-  }
-  let raw = '';
-  req.setEncoding('utf8');
-  req.on('data', (chunk) => {
-    raw += chunk;
   });
-  req.on('end', () => {
-    if (!raw) {
-      req.body = {};
+
+  return corsMiddleware(c, next);
+});
+
+// ---------- Rate limiter sederhana (in-memory, per-isolate) ----------
+// Catatan: Workers bisa jalan di banyak isolate paralel, jadi ini
+// bukan rate limit yang 100% akurat secara global seperti versi
+// express-rate-limit di server Node biasa. Untuk rate limit yang
+// benar-benar akurat lintas edge, idealnya pakai Cloudflare KV /
+// Durable Objects / Cloudflare Rate Limiting binding. Versi di bawah
+// ini cukup untuk proteksi dasar per-isolate.
+function createRateLimiter({ windowMs, max, message }) {
+  const hits = new Map(); // key -> { count, resetAt }
+
+  return async (c, next) => {
+    const ip =
+      c.req.header('cf-connecting-ip') ||
+      c.req.header('x-forwarded-for') ||
+      'unknown';
+    const now = Date.now();
+    const entry = hits.get(ip);
+
+    if (!entry || now > entry.resetAt) {
+      hits.set(ip, { count: 1, resetAt: now + windowMs });
       return next();
     }
-    try {
-      req.body = JSON.parse(raw);
-      next();
-    } catch {
-      res.status(400).json({ success: false, message: 'Body request bukan JSON yang valid.' });
+
+    if (entry.count >= max) {
+      return c.json(message, 429);
     }
-  });
-  req.on('error', () => {
-    res.status(400).json({ success: false, message: 'Gagal membaca body request.' });
-  });
+
+    entry.count += 1;
+    return next();
+  };
 }
 
-app.use(parseJsonBody);
-
-const globalLimiter = rateLimit({
+const globalLimiter = createRateLimiter({
   windowMs: 60 * 1000,
   max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
   message: { success: false, message: 'Terlalu banyak request, coba lagi sebentar lagi.' },
 });
-app.use(globalLimiter);
+app.use('*', globalLimiter);
 
-const downloadLimiter = rateLimit({
+const downloadLimiter = createRateLimiter({
   windowMs: 60 * 1000,
   max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
   message: { success: false, message: 'Terlalu banyak permintaan unduh, coba lagi sebentar lagi.' },
 });
 
-app.get('/health', (req, res) => res.status(200).send('OK'));
+// ---------- Health check ----------
+app.get('/health', (c) => c.text('OK', 200));
 
+// ---------- Helper functions (persis logika lama) ----------
 function isValidPlatformUrl(url, platform) {
   try {
     const { hostname } = new URL(url);
@@ -163,20 +169,31 @@ function normalizeInstagram(raw) {
   };
 }
 
-app.post('/api/download', downloadLimiter, async (req, res) => {
-  const { url, platform, quality, removeWatermark } = req.body || {};
+// ---------- Endpoint utama ----------
+app.post('/api/download', downloadLimiter, async (c) => {
+  let body;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ success: false, message: 'Body request bukan JSON yang valid.' }, 400);
+  }
+
+  const { url, platform, quality, removeWatermark } = body || {};
 
   if (!url || !platform) {
-    return res.status(400).json({ success: false, message: 'url dan platform wajib diisi.' });
+    return c.json({ success: false, message: 'url dan platform wajib diisi.' }, 400);
   }
   if (platform !== 'tiktok' && platform !== 'instagram') {
-    return res.status(400).json({ success: false, message: 'platform harus "tiktok" atau "instagram".' });
+    return c.json({ success: false, message: 'platform harus "tiktok" atau "instagram".' }, 400);
   }
   if (!isValidPlatformUrl(url, platform)) {
-    return res.status(400).json({
-      success: false,
-      message: `Link ini bukan link ${platform === 'tiktok' ? 'TikTok' : 'Instagram'} yang valid.`,
-    });
+    return c.json(
+      {
+        success: false,
+        message: `Link ini bukan link ${platform === 'tiktok' ? 'TikTok' : 'Instagram'} yang valid.`,
+      },
+      400
+    );
   }
 
   const wantAudioOnly = quality === 'audio';
@@ -193,13 +210,16 @@ app.post('/api/download', downloadLimiter, async (req, res) => {
     }
 
     if (!normalized || (!normalized.downloadUrl && !normalized.audioUrl)) {
-      return res.status(404).json({
-        success: false,
-        message: 'Video tidak ditemukan. Pastikan link publik (bukan akun privat) dan masih tersedia.',
-      });
+      return c.json(
+        {
+          success: false,
+          message: 'Video tidak ditemukan. Pastikan link publik (bukan akun privat) dan masih tersedia.',
+        },
+        404
+      );
     }
 
-    res.json({
+    return c.json({
       success: true,
       data: {
         ...normalized,
@@ -208,20 +228,17 @@ app.post('/api/download', downloadLimiter, async (req, res) => {
     });
   } catch (err) {
     console.error('[/api/download] error:', err);
-    res.status(500).json({
-      success: false,
-      message: 'Gagal memproses link ini sekarang. Coba lagi beberapa saat lagi.',
-    });
+    return c.json(
+      {
+        success: false,
+        message: 'Gagal memproses link ini sekarang. Coba lagi beberapa saat lagi.',
+      },
+      500
+    );
   }
 });
 
-app.use((req, res) => {
-  res.status(404).json({ success: false, message: 'Endpoint tidak ditemukan.' });
-});
+// ---------- 404 handler ----------
+app.notFound((c) => c.json({ success: false, message: 'Endpoint tidak ditemukan.' }, 404));
 
-// Port di sini murni internal (dipakai httpServerHandler untuk
-// menyambungkan request Workers ke instance Express-nya) — BUKAN
-// port publik yang perlu kamu buka/atur di mana pun.
-app.listen(8080);
-
-export default httpServerHandler({ port: 8080 });
+export default app;
