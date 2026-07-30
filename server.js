@@ -39,7 +39,40 @@ app.use(
   })
 );
 
-app.use(express.json());
+// PENTING: sengaja TIDAK pakai express.json() bawaan.
+// express.json() -> body-parser -> raw-body -> iconv-lite, dan iconv-lite
+// memakai modul node:stream dengan cara yang belum didukung penuh oleh
+// polyfill nodejs_compat di Cloudflare Workers (error saat deploy:
+// "require_streams(...) is not a function"). Middleware manual di bawah
+// ini melakukan hal yang sama (baca body, parse JSON) tanpa dependency
+// yang bermasalah tersebut.
+function parseJsonBody(req, res, next) {
+  if (req.method !== 'POST' && req.method !== 'PUT' && req.method !== 'PATCH') {
+    return next();
+  }
+  let raw = '';
+  req.setEncoding('utf8');
+  req.on('data', (chunk) => {
+    raw += chunk;
+  });
+  req.on('end', () => {
+    if (!raw) {
+      req.body = {};
+      return next();
+    }
+    try {
+      req.body = JSON.parse(raw);
+      next();
+    } catch {
+      res.status(400).json({ success: false, message: 'Body request bukan JSON yang valid.' });
+    }
+  });
+  req.on('error', () => {
+    res.status(400).json({ success: false, message: 'Gagal membaca body request.' });
+  });
+}
+
+app.use(parseJsonBody);
 
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
