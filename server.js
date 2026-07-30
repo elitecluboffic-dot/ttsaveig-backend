@@ -1,37 +1,39 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { ttdl, igdl } from 'btch-downloader';
 
 /* =========================================================
    TTSAVEIG BACKEND — versi Cloudflare Workers (Hono)
    Project terpisah dari frontend (frontend ada di Worker lain,
    folder ttsaveig/, di telehub.web.id/ttsaveig).
 
-   Kenapa pindah dari Express ke Hono:
-   - Express (lib/express.js) melakukan require('body-parser') di
-     level teratas modul, walaupun kita tidak pernah memanggil
-     express.json(). body-parser -> raw-body -> iconv-lite, dan
-     iconv-lite memanggil require_streams(...) dari polyfill
-     node:stream milik nodejs_compat, yang belum didukung penuh oleh
-     Cloudflare Workers (error saat deploy: "require_streams(...) is
-     not a function"). Middleware manual pun tidak menolong karena
-     masalahnya ada di import express itu sendiri, bukan di
-     middleware-nya.
-   - Hono dibangun khusus untuk runtime Workers/edge, tidak menyentuh
-     node:stream, iconv-lite, atau body-parser sama sekali. Tidak
-     perlu httpServerHandler / cloudflare:node / app.listen() lagi —
-     Hono langsung export default { fetch }.
+   RIWAYAT PERBAIKAN:
+   1) Awalnya pakai Express -> gagal deploy karena Express selalu
+      menarik body-parser -> raw-body -> iconv-lite di level modul,
+      dan iconv-lite memanggil require_streams(...) yang belum
+      didukung penuh oleh polyfill nodejs_compat Cloudflare.
+      -> Solusi: pindah ke Hono, yang memang dibuat untuk runtime
+      Workers/edge dan tidak menyentuh node:stream sama sekali.
 
-   Environment variable (ALLOWED_ORIGIN) tetap diatur lewat "vars" di
-   wrangler.jsonc / `wrangler secret put`, dan diakses lewat c.env,
-   BUKAN process.env (di Hono, env per-request lewat context, lebih
-   idiomatis untuk Workers dibanding process.env ala Node).
+   2) Setelah pindah ke Hono, muncul error baru: "Dynamic require of
+      axios is not supported". Ini datang dari package btch-downloader
+      (dan dependency internalnya, btch-http), yang pakai axios dengan
+      pola require() yang tidak bisa dibundel esbuild untuk Workers.
+      -> Solusi: HAPUS btch-downloader sepenuhnya. Setelah ditelusuri,
+      ternyata btch-downloader cuma pembungkus tipis di atas backend
+      HTTP publik di https://backend1.tioo.eu.org — versi browser dari
+      library ini bahkan cuma pakai fetch() biasa, tanpa axios sama
+      sekali. Jadi endpoint itu kita panggil langsung di bawah ini,
+      tanpa dependency pihak ketiga yang bermasalah.
+
+   Catatan: backend1.tioo.eu.org adalah layanan pihak ketiga yang tidak
+   dioperasikan oleh kita. Kalau suatu saat mereka mengubah format
+   respons atau endpoint-nya, fungsi ttdl()/igdl() di bawah ini perlu
+   disesuaikan lagi.
 ========================================================= */
 
 const app = new Hono();
 
 // ---------- CORS ----------
-// origin di-resolve per-request supaya bisa baca c.env.ALLOWED_ORIGIN
 app.use('*', async (c, next) => {
   const allowedOrigins = (c.env.ALLOWED_ORIGIN || '')
     .split(',')
@@ -43,7 +45,7 @@ app.use('*', async (c, next) => {
       if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
         return origin || '*';
       }
-      return null; // ditolak
+      return null;
     },
   });
 
@@ -51,14 +53,10 @@ app.use('*', async (c, next) => {
 });
 
 // ---------- Rate limiter sederhana (in-memory, per-isolate) ----------
-// Catatan: Workers bisa jalan di banyak isolate paralel, jadi ini
-// bukan rate limit yang 100% akurat secara global seperti versi
-// express-rate-limit di server Node biasa. Untuk rate limit yang
-// benar-benar akurat lintas edge, idealnya pakai Cloudflare KV /
-// Durable Objects / Cloudflare Rate Limiting binding. Versi di bawah
-// ini cukup untuk proteksi dasar per-isolate.
+// Catatan: bukan rate limit yang 100% akurat secara global di Workers
+// (isolate bisa paralel), tapi cukup untuk proteksi dasar.
 function createRateLimiter({ windowMs, max, message }) {
-  const hits = new Map(); // key -> { count, resetAt }
+  const hits = new Map();
 
   return async (c, next) => {
     const ip =
@@ -98,7 +96,37 @@ const downloadLimiter = createRateLimiter({
 // ---------- Health check ----------
 app.get('/health', (c) => c.text('OK', 200));
 
-// ---------- Helper functions (persis logika lama) ----------
+// ---------- Klien backend (pengganti btch-downloader) ----------
+// Persis pola yang dipakai versi browser resmi btch-downloader:
+// GET https://backend1.tioo.eu.org/{endpoint}?url={url}
+const BTCH_BASE_URL = 'https://backend1.tioo.eu.org';
+
+async function btchGet(endpoint, url) {
+  const target = `${BTCH_BASE_URL}/${endpoint}?url=${encodeURIComponent(url)}`;
+  const res = await fetch(target, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ttsaveig-backend)' },
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}: request ke backend gagal`);
+  }
+  try {
+    return await res.json();
+  } catch {
+    return await res.text();
+  }
+}
+
+// Bentuk respons mentah TikTok: { title, title_audio, thumbnail, video: [...], audio: [...] }
+async function ttdl(url) {
+  return btchGet('ttdl', url);
+}
+
+// Bentuk respons mentah Instagram: array [{ thumbnail, url }, ...]
+async function igdl(url) {
+  return btchGet('igdl', url);
+}
+
+// ---------- Helper functions ----------
 function isValidPlatformUrl(url, platform) {
   try {
     const { hostname } = new URL(url);
@@ -127,26 +155,23 @@ function pickFirst(obj, keys) {
 }
 
 function normalizeTikTok(raw, wantAudioOnly) {
-  const item = Array.isArray(raw) ? raw[0] : raw;
-  if (!item) return null;
+  if (!raw) return null;
 
-  const noWatermarkUrl = pickFirst(item, ['video', 'play', 'nowm', 'no_watermark', 'hd', 'video_hd']);
-  const audioUrl = pickFirst(item, ['audio', 'music', 'mp3']);
-  const thumbnail = pickFirst(item, ['thumbnail', 'cover', 'image']);
-  const title = pickFirst(item, ['title', 'desc', 'caption']);
-  const author = pickFirst(item, ['author', 'username', 'nickname']);
+  // raw.video dan raw.audio adalah array URL (sesuai bentuk asli backend)
+  const videoArr = Array.isArray(raw.video) ? raw.video : raw.video ? [raw.video] : [];
+  const audioArr = Array.isArray(raw.audio) ? raw.audio : raw.audio ? [raw.audio] : [];
 
-  const downloadUrl = Array.isArray(noWatermarkUrl) ? noWatermarkUrl[0] : noWatermarkUrl;
-  const resolvedAudioUrl = Array.isArray(audioUrl) ? audioUrl[0] : audioUrl;
+  const downloadUrl = videoArr[0] || null;
+  const resolvedAudioUrl = audioArr[0] || null;
 
   if (!downloadUrl && !resolvedAudioUrl) return null;
 
   return {
-    title: title || 'Video TikTok',
-    author: author || '',
-    thumbnail: Array.isArray(thumbnail) ? thumbnail[0] : thumbnail || '',
-    downloadUrl: wantAudioOnly ? null : downloadUrl || null,
-    audioUrl: resolvedAudioUrl || null,
+    title: raw.title || 'Video TikTok',
+    author: raw.author || '',
+    thumbnail: raw.thumbnail || '',
+    downloadUrl: wantAudioOnly ? null : downloadUrl,
+    audioUrl: resolvedAudioUrl,
   };
 }
 
