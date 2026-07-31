@@ -144,6 +144,32 @@ import { cors } from 'hono/cors';
       - Semua kode terkait (handleProxy, isAllowedMediaUrl,
         ALLOWED_MEDIA_HOSTS, route /api/proxy & /api/proxy/, handler
         HEAD-nya) dihapus dari file ini.
+
+   10) TOMBOL "UNDUH" MALAH MEMBUKA FILE DI TAB BARU, BUKAN DOWNLOAD
+       (update ini):
+      - Setelah poin 9, link download di frontend menunjuk LANGSUNG ke
+        URL sumber (mis. i.pinimg.com/...). Atribut HTML `download` di
+        tag <a> HANYA berlaku untuk URL SAME-ORIGIN -> begitu URL-nya
+        cross-origin (beda domain dari situs Reelgrab), browser
+        mengabaikan atribut `download` itu dan cuma menavigasi
+        (membuka) file-nya di tab, bukan memicu dialog "Save As".
+        Ini murni perilaku standar browser, bukan bug di parsing/media.
+      - Solusi: ditambahkan endpoint /api/download-file yang men-STREAM
+        (bukan buffer penuh ke memory seperti /api/proxy versi lama di
+        poin 3-5) isi file dari sumber ke browser, dengan header
+        `Content-Disposition: attachment` -> ini memaksa browser
+        mendownload file apa pun originnya, TANPA perlu menampung
+        seluruh isi file di memory Worker (upstream.body diteruskan
+        langsung sebagai ReadableStream), jadi tidak mengulang masalah
+        resource limit 1102 dari proxy lama.
+      - Endpoint ini HANYA dipakai untuk tombol unduh (klik eksplisit
+        oleh user), BUKAN untuk elemen <video>/<img> preview di kartu
+        hasil maupun mockup hp -> supaya trafik Worker tetap minim dan
+        cuma dipakai saat benar-benar dibutuhkan.
+      - Whitelist host (ALLOWED_MEDIA_HOSTS) dan validasi
+        isAllowedMediaUrl() dihidupkan lagi khusus untuk endpoint ini,
+        supaya Worker tidak menjadi open proxy yang bisa dipakai
+        mendownload file dari domain sembarangan.
 ========================================================= */
 
 const app = new Hono();
@@ -716,6 +742,102 @@ function normalizePinterest(rawInput) {
     isVideo,
   };
 }
+
+// ---------- Whitelist host media (khusus /api/download-file) ----------
+// Dipakai supaya Worker tidak jadi open proxy yang bisa dipaksa
+// mendownload file dari domain sembarangan -- hanya host CDN sumber
+// yang memang dipakai backend (ttdl/igdl/pindl) yang diizinkan.
+const ALLOWED_MEDIA_HOSTS = [
+  // TikTok - video CDN
+  /(^|\.)tiktokcdn\.com$/,
+  /(^|\.)tiktokcdn-us\.com$/,
+  /(^|\.)tiktokcdn-eu\.com$/,
+  /(^|\.)tiktokv\.com$/,
+  /(^|\.)tiktokv-eu\.com$/,
+  /(^|\.)dl\.tiktokio\.com$/,
+  // Instagram / Facebook CDN
+  /(^|\.)cdninstagram\.com$/,
+  /(^|\.)fbcdn\.net$/,
+  // Pinterest - gambar & video sama-sama di *.pinimg.com
+  /(^|\.)pinimg\.com$/,
+  // backend pihak ketiga yang dipakai
+  /(^|\.)tioo\.eu\.org$/,
+];
+
+function isAllowedMediaUrl(rawUrl) {
+  try {
+    const { hostname, protocol } = new URL(rawUrl);
+    if (protocol !== 'https:') return false;
+    return ALLOWED_MEDIA_HOSTS.some((re) => re.test(hostname));
+  } catch {
+    return false;
+  }
+}
+
+// Bikin nama file aman dipakai di header Content-Disposition (hilangkan
+// karakter yang bisa merusak header seperti newline & kutip, batasi
+// panjang supaya tidak berlebihan).
+function sanitizeFilename(name) {
+  const fallback = 'reelgrab-download';
+  if (!name || typeof name !== 'string') return fallback;
+  const cleaned = name
+    .replace(/[\r\n"]/g, '')
+    .replace(/[\\/:*?<>|]/g, '_')
+    .trim()
+    .slice(0, 100);
+  return cleaned || fallback;
+}
+
+// ---------- Endpoint download streaming (memaksa "Save As") ----------
+// Berbeda dari /api/proxy versi lama (poin 3-5, sudah dihapus di poin 9):
+// endpoint ini TIDAK membuffer seluruh isi file ke memory Worker.
+// upstream.body (ReadableStream) diteruskan langsung ke browser, jadi
+// resource yang dipakai Worker tetap minim walau filenya besar -> tidak
+// mengulang error 1102 (resource limit) dari proxy lama.
+app.get('/api/download-file', async (c) => {
+  const targetUrl = c.req.query('url');
+  const filename = sanitizeFilename(c.req.query('filename'));
+
+  if (!targetUrl) {
+    return c.json({ success: false, message: 'Parameter url wajib diisi.' }, 400);
+  }
+  if (!isAllowedMediaUrl(targetUrl)) {
+    console.warn('[/api/download-file] host ditolak whitelist:', targetUrl);
+    return c.json({ success: false, message: 'Sumber media tidak diizinkan.' }, 403);
+  }
+
+  let upstream;
+  try {
+    upstream = await fetch(targetUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ttsaveig-backend)' },
+    });
+  } catch (err) {
+    console.error('[/api/download-file] fetch error:', targetUrl, err);
+    return c.json({ success: false, message: 'Gagal mengambil media dari sumber.' }, 502);
+  }
+
+  if (!upstream.ok || !upstream.body) {
+    console.error('[/api/download-file] upstream non-OK:', upstream.status, targetUrl);
+    return c.json(
+      { success: false, message: `Sumber media merespons status ${upstream.status}.` },
+      502
+    );
+  }
+
+  const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+  const contentLength = upstream.headers.get('content-length');
+
+  const headers = {
+    'content-type': contentType,
+    'content-disposition': `attachment; filename="${filename}"`,
+    'access-control-allow-origin': '*',
+  };
+  if (contentLength) headers['content-length'] = contentLength;
+
+  // upstream.body diteruskan APA ADANYA (streaming) -> Worker tidak
+  // pernah menampung seluruh file di memory sekaligus.
+  return new Response(upstream.body, { status: 200, headers });
+});
 
 // ---------- Endpoint utama ----------
 app.post('/api/download', downloadLimiter, async (c) => {
