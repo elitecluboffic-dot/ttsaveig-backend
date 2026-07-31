@@ -30,6 +30,15 @@ import { cors } from 'hono/cors';
       oleh browser user. Semua byte video sekarang melewati Worker
       ini dulu sebelum sampai ke browser.
 
+   4) /api/proxy diperbaiki: link sumber (mis. dl.tiktokio.com) pakai
+      token sekali-pakai, sedangkan tag <video> di browser mengirim
+      beberapa request Range terpisah -> tiap request lama memicu
+      fetch BARU ke sumber -> request kedua dst gagal (404) karena
+      token sudah "dipakai". Sekarang: fetch ke sumber HANYA SEKALI
+      (tanpa meneruskan Range ke upstream), hasilnya disimpan di
+      Cloudflare Cache API per targetUrl, lalu semua request Range
+      dari browser dilayani dari cache tsb.
+
    Catatan: backend1.tioo.eu.org adalah layanan pihak ketiga yang tidak
    dioperasikan oleh kita. Kalau suatu saat mereka mengubah format
    respons atau endpoint-nya, fungsi ttdl()/igdl() di bawah ini perlu
@@ -292,9 +301,15 @@ function isAllowedMediaUrl(rawUrl) {
   }
 }
 
-// ---------- Endpoint proxy media ----------
-// Browser akses videonya lewat sini, bukan langsung ke server sumber.
-// Support Range header supaya video tetap bisa di-seek/scrub normal.
+// ---------- Endpoint proxy media (versi diperbaiki) ----------
+// Masalah sebelumnya: link sumber (mis. dl.tiktokio.com) pakai token
+// sekali-pakai. Tag <video> di browser kirim beberapa request Range
+// terpisah, dan tiap request itu men-trigger fetch BARU ke sumber ->
+// request kedua dst gagal (404) karena token sudah "dipakai".
+//
+// Perbaikan: fetch ke sumber HANYA SEKALI, simpan hasilnya di Cloudflare
+// Cache API (per targetUrl, bukan per Range), lalu semua request Range
+// dari browser dilayani dari cache tsb, bukan fetch ulang ke sumber.
 app.get('/api/proxy', async (c) => {
   const targetUrl = c.req.query('url');
 
@@ -305,49 +320,88 @@ app.get('/api/proxy', async (c) => {
     return c.json({ success: false, message: 'Sumber media tidak diizinkan.' }, 403);
   }
 
-  const rangeHeader = c.req.header('range');
+  const cache = caches.default;
+  // Cache key sengaja diambil dari targetUrl saja (tanpa Range),
+  // supaya semua request Range untuk video yang sama dianggap 1 entri cache.
+  const cacheKey = new Request(
+    `https://cache-key.internal/proxy?u=${encodeURIComponent(targetUrl)}`
+  );
 
-  let upstream;
-  try {
-    upstream = await fetch(targetUrl, {
+  let fullResponse = await cache.match(cacheKey);
+
+  if (!fullResponse) {
+    let upstream;
+    try {
+      upstream = await fetch(targetUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ttsaveig-backend)' },
+        // sengaja TIDAK mengirim Range di sini -> selalu minta file utuh
+      });
+    } catch (err) {
+      console.error('[/api/proxy] fetch error:', err);
+      return c.json({ success: false, message: 'Gagal mengambil media dari sumber.' }, 502);
+    }
+
+    if (!upstream.ok) {
+      return c.json(
+        { success: false, message: `Sumber media merespons status ${upstream.status}.` },
+        502
+      );
+    }
+
+    const buffer = await upstream.arrayBuffer();
+    const contentType = upstream.headers.get('content-type') || 'video/mp4';
+
+    fullResponse = new Response(buffer, {
+      status: 200,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; ttsaveig-backend)',
-        ...(rangeHeader ? { Range: rangeHeader } : {}),
+        'content-type': contentType,
+        'content-length': String(buffer.byteLength),
+        'accept-ranges': 'bytes',
+        // cache di edge selama 2 menit, cukup untuk satu sesi nonton preview
+        'cache-control': 'public, max-age=120',
       },
     });
-  } catch (err) {
-    console.error('[/api/proxy] fetch error:', err);
-    return c.json({ success: false, message: 'Gagal mengambil media dari sumber.' }, 502);
+
+    c.executionCtx.waitUntil(cache.put(cacheKey, fullResponse.clone()));
   }
 
-  if (!upstream.ok && upstream.status !== 206) {
-    return c.json(
-      { success: false, message: `Sumber media merespons status ${upstream.status}.` },
-      502
-    );
+  const totalBuffer = await fullResponse.clone().arrayBuffer();
+  const total = totalBuffer.byteLength;
+  const contentType = fullResponse.headers.get('content-type') || 'video/mp4';
+  const rangeHeader = c.req.header('range');
+
+  const baseHeaders = {
+    'content-type': contentType,
+    'accept-ranges': 'bytes',
+    'access-control-allow-origin': '*',
+    'content-disposition': 'inline; filename="reelgrab-video.mp4"',
+  };
+
+  if (rangeHeader) {
+    const match = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
+    let start = match && match[1] ? parseInt(match[1], 10) : 0;
+    let end = match && match[2] ? parseInt(match[2], 10) : total - 1;
+    if (Number.isNaN(start) || start < 0) start = 0;
+    if (Number.isNaN(end) || end >= total) end = total - 1;
+
+    const chunk = totalBuffer.slice(start, end + 1);
+
+    return new Response(chunk, {
+      status: 206,
+      headers: {
+        ...baseHeaders,
+        'content-range': `bytes ${start}-${end}/${total}`,
+        'content-length': String(chunk.byteLength),
+      },
+    });
   }
 
-  // Teruskan header penting apa adanya (content-type, content-length, accept-ranges, dll)
-  const headers = new Headers();
-  const passthroughHeaders = [
-    'content-type',
-    'content-length',
-    'content-range',
-    'accept-ranges',
-    'cache-control',
-    'last-modified',
-    'etag',
-  ];
-  for (const key of passthroughHeaders) {
-    const value = upstream.headers.get(key);
-    if (value) headers.set(key, value);
-  }
-  headers.set('Access-Control-Allow-Origin', '*');
-  headers.set('Content-Disposition', 'inline; filename="reelgrab-video.mp4"');
-
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers,
+  return new Response(totalBuffer, {
+    status: 200,
+    headers: {
+      ...baseHeaders,
+      'content-length': String(total),
+    },
   });
 });
 
