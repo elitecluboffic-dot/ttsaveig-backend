@@ -102,6 +102,29 @@ import { cors } from 'hono/cors';
         Pinterest:' — isi JSON di baris itu adalah bentuk respons
         ASLI dari backend, dan itulah yang dibutuhkan untuk
         menyesuaikan normalizePinterest() secara presisi.
+
+   8) CLOUDFLARE TURNSTILE (CAPTCHA) SEBELUM /api/download (update ini):
+      - Ditambahkan verifikasi Cloudflare Turnstile supaya endpoint
+        /api/download tidak bisa dipanggil otomatis oleh bot/script
+        tanpa menyelesaikan captcha dulu di sisi frontend.
+      - Frontend (index.html + script.js) mengirim token Turnstile
+        hasil widget lewat field `turnstileToken` di body JSON.
+      - Backend (endpoint ini) SELALU verifikasi token itu ke endpoint
+        resmi Cloudflare `siteverify` sebelum lanjut memproses link
+        apa pun -> kalau token kosong/invalid/kedaluwarsa, request
+        ditolak dengan 400/403 tanpa pernah menyentuh ttdl/igdl/pindl.
+      - Secret key Turnstile TIDAK di-hardcode di kode -> harus diisi
+        lewat Worker secret bernama TURNSTILE_SECRET_KEY (lihat env
+        binding di wrangler, cara set-nya lewat:
+        `wrangler secret put TURNSTILE_SECRET_KEY`). Site key (public)
+        ada di sisi frontend, diisi di config.js sebagai
+        `window.TURNSTILE_SITE_KEY`.
+      - Kalau env TURNSTILE_SECRET_KEY belum di-set sama sekali di
+        Worker (mis. lupa setup), endpoint akan otomatis menolak semua
+        request download dengan pesan error yang jelas ("captcha belum
+        dikonfigurasi di server"), BUKAN diam-diam meloloskan request
+        tanpa verifikasi -> ini sengaja supaya tidak ada mode "gagal
+        terbuka" yang bikin proteksi captcha bocor tanpa disadari.
 ========================================================= */
 
 const app = new Hono();
@@ -228,6 +251,83 @@ async function pindl(url) {
   // Semua kandidat endpoint gagal -> lempar error gabungan supaya
   // ketahuan di log endpoint mana saja yang sudah dicoba.
   throw new Error(`Semua endpoint Pinterest gagal -> ${errors.join(' | ')}`);
+}
+
+// ---------- Verifikasi Cloudflare Turnstile (CAPTCHA) ----------
+const TURNSTILE_VERIFY_URL =
+  'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+
+// Hasil: { ok: true } kalau token valid, atau { ok: false, reason, status }
+// kalau ditolak -> dipakai handler /api/download buat mutusin status HTTP
+// & pesan yang paling pas dikirim balik ke frontend.
+async function verifyTurnstileToken(c, token) {
+  const secretKey = c.env.TURNSTILE_SECRET_KEY;
+
+  // Sengaja TIDAK "gagal terbuka": kalau secret belum di-set di Worker
+  // (lupa configure), semua request download ditolak dengan pesan jelas,
+  // bukan diam-diam meloloskan tanpa verifikasi captcha sama sekali.
+  if (!secretKey) {
+    console.error(
+      '[turnstile] TURNSTILE_SECRET_KEY belum di-set di environment Worker.'
+    );
+    return {
+      ok: false,
+      status: 500,
+      reason: 'Verifikasi captcha belum dikonfigurasi di server. Hubungi admin.',
+    };
+  }
+
+  if (!token || typeof token !== 'string' || !token.trim()) {
+    return {
+      ok: false,
+      status: 400,
+      reason: 'Captcha belum diselesaikan. Selesaikan verifikasi terlebih dahulu.',
+    };
+  }
+
+  const remoteIp =
+    c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || undefined;
+
+  const form = new URLSearchParams();
+  form.set('secret', secretKey);
+  form.set('response', token);
+  if (remoteIp) form.set('remoteip', remoteIp);
+
+  let result;
+  try {
+    const res = await fetch(TURNSTILE_VERIFY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form.toString(),
+    });
+    result = await res.json();
+  } catch (err) {
+    console.error('[turnstile] gagal menghubungi siteverify:', err);
+    return {
+      ok: false,
+      status: 502,
+      reason: 'Gagal memverifikasi captcha sekarang. Coba lagi beberapa saat lagi.',
+    };
+  }
+
+  if (!result || result.success !== true) {
+    const errorCodes = (result && result['error-codes']) || [];
+    console.warn('[turnstile] verifikasi ditolak:', errorCodes);
+
+    // 'timeout-or-duplicate' artinya token sudah pernah dipakai atau
+    // kedaluwarsa -> pesan khusus supaya user tahu harus ulang captcha,
+    // bukan sekadar "salah".
+    const isExpiredOrReused = errorCodes.includes('timeout-or-duplicate');
+    return {
+      ok: false,
+      status: 403,
+      reason: isExpiredOrReused
+        ? 'Captcha sudah kedaluwarsa atau sudah dipakai. Selesaikan captcha lagi.'
+        : 'Verifikasi captcha gagal. Selesaikan captcha lagi lalu coba ulang.',
+    };
+  }
+
+  return { ok: true };
 }
 
 // ---------- Helper functions ----------
@@ -607,7 +707,16 @@ app.post('/api/download', downloadLimiter, async (c) => {
     return c.json({ success: false, message: 'Body request bukan JSON yang valid.' }, 400);
   }
 
-  const { url, platform, quality, removeWatermark } = body || {};
+  const { url, platform, quality, removeWatermark, turnstileToken } = body || {};
+
+  // ---------- Verifikasi captcha Turnstile SELALU paling awal ----------
+  // Dicek sebelum validasi url/platform apa pun, supaya request tanpa
+  // captcha valid tidak pernah sampai memicu pemanggilan backend
+  // pihak ketiga (ttdl/igdl/pindl) sama sekali.
+  const turnstileCheck = await verifyTurnstileToken(c, turnstileToken);
+  if (!turnstileCheck.ok) {
+    return c.json({ success: false, message: turnstileCheck.reason }, turnstileCheck.status);
+  }
 
   if (!url || !platform) {
     return c.json({ success: false, message: 'url dan platform wajib diisi.' }, 400);
