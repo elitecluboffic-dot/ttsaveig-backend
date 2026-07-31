@@ -172,33 +172,68 @@ import { cors } from 'hono/cors';
         mendownload file dari domain sembarangan.
 
    11) PROTEKSI /api/download-file SUPAYA TIDAK BISA DIPANGGIL DARI LUAR
-       SITUS (update ini):
+       SITUS (dulu, sekarang DIGANTI — lihat poin 12):
       - /api/download-file sebelumnya bisa dipanggil dari mana saja
         selama URL targetnya lolos whitelist host -> siapa pun yang tahu
         pola URL-nya bisa numpang bandwidth situs ini tanpa lewat form
         atau captcha Turnstile sama sekali.
-      - Solusi: ditambahkan isRequestFromOwnSite() yang mencocokkan
-        header Origin (atau fallback ke Referer kalau Origin kosong,
-        karena beberapa browser tidak selalu mengirim Origin untuk
-        navigasi GET biasa) terhadap daftar ALLOWED_ORIGIN yang sama
-        dipakai middleware CORS di atas. Request tanpa Origin/Referer
-        yang cocok ditolak dengan 403.
-      - downloadLimiter (limit 20/menit per IP, sama seperti
-        /api/download) juga diterapkan ke endpoint ini, yang
-        sebelumnya cuma kena globalLimiter (60/menit).
-      - BATASAN PENTING yang perlu disadari: header Origin/Referer TIDAK
-        BISA dipalsukan oleh JavaScript yang berjalan di browser
-        pengguna biasa (browser sendiri yang mengunci nilainya), jadi
-        ini efektif menolak bot/script yang asal menembak URL endpoint
-        dari luar situs. TAPI siapa pun yang memanggil endpoint ini
-        langsung lewat tools seperti curl/Python requests/Postman
-        (bukan lewat browser yang benar-benar membuka situs kita) tetap
-        BISA menyetel header itu ke nilai apa pun secara bebas -> ini
-        BUKAN proteksi anti-pemalsuan yang sempurna. Kalau suatu saat
-        butuh proteksi yang benar-benar tidak bisa dipalsukan sama
-        sekali, itu perlu mekanisme lain (mis. signed token/HMAC
-        per-request yang dibuat oleh /api/download dan diverifikasi di
-        sini), bukan sekadar mengandalkan header Origin/Referer.
+      - Solusi (LAMA): isRequestFromOwnSite() mencocokkan header Origin
+        (atau fallback ke Referer kalau Origin kosong) terhadap daftar
+        ALLOWED_ORIGIN yang sama dipakai middleware CORS di atas.
+      - MASALAH YANG TERBUKTI DI LAPANGAN: tombol "Unduh Gambar" di
+        frontend sering gagal dengan pesan "Permintaan hanya diizinkan
+        dari situs Reelgrab" PADAHAL user memang klik dari situs asli.
+        Penyebabnya, Origin/Referer TIDAK SELALU dikirim browser untuk
+        navigasi biasa:
+          * <a rel="noreferrer"> (atau "noopener noreferrer") membuat
+            Referer tidak dikirim sama sekali.
+          * Meta tag <meta name="referrer" content="no-referrer"> atau
+            header Referrer-Policy: no-referrer di halaman frontend.
+          * Origin memang secara umum TIDAK dikirim browser untuk
+            navigasi GET biasa (cuma untuk fetch/XHR/POST cross-site),
+            jadi selalu jatuh ke pengecekan Referer.
+          * Ekstensi privasi / mode browser tertentu bisa strip Referer.
+      - KESIMPULAN: Origin/Referer bukan proteksi yang bisa diandalkan
+        untuk kasus ini, walau secara teori tidak bisa dipalsukan oleh
+        JS halaman lain. Diganti dengan signed token, lihat poin 12.
+
+   12) GANTI PROTEKSI /api/download-file DARI Origin/Referer MENJADI
+       SIGNED TOKEN (HMAC-SHA256) — update ini:
+      - /api/download sekarang membuat token sekali-pakai (mengikat
+        target URL + waktu kedaluwarsa) untuk setiap downloadUrl /
+        audioUrl yang dikembalikan, ditandatangani pakai HMAC-SHA256
+        dengan secret Worker (env DOWNLOAD_TOKEN_SECRET, lewat
+        Web Crypto API `crypto.subtle` bawaan Workers runtime).
+      - Response /api/download sekarang juga menyertakan
+        `downloadFileUrl` (dan `audioDownloadFileUrl` kalau ada audio)
+        yaitu URL absolut ke /api/download-file yang SUDAH berisi query
+        `token=...` -> frontend TINGGAL PAKAI LANGSUNG url ini di
+        tombol "Unduh", tidak perlu bikin/rakit URL sendiri lagi.
+      - /api/download-file sekarang WAJIB membawa `token` yang valid
+        (belum kedaluwarsa, tanda tangan cocok, dan terikat persis ke
+        `url` yang diminta) -> ini tidak bergantung sama sekali pada
+        header Origin/Referer, jadi tidak lagi rusak oleh
+        rel="noreferrer", Referrer-Policy, ekstensi privasi, dsb.
+      - Token berlaku singkat (default 5 menit, lihat
+        DOWNLOAD_TOKEN_TTL_MS) supaya tidak bisa dipakai ulang lama-lama
+        atau disebar sebagai link publik permanen.
+      - BACKWARD COMPATIBILITY: kalau env DOWNLOAD_TOKEN_SECRET BELUM
+        di-set di Worker, /api/download-file otomatis fallback ke
+        pengecekan Origin/Referer lama (isRequestFromOwnSite) supaya
+        tidak langsung mati total kalau lupa setup -> tapi ini TIDAK
+        direkomendasikan untuk produksi. Wajib jalankan:
+        `wrangler secret put DOWNLOAD_TOKEN_SECRET`
+        (isi bebas, string acak yang panjang & rahasia) supaya proteksi
+        yang lebih kuat ini benar-benar aktif.
+      - WAJIB DI FRONTEND: tombol "Unduh Gambar"/"Unduh Video" harus
+        pakai `data.downloadFileUrl` (atau `data.audioDownloadFileUrl`
+        untuk audio) dari response /api/download, BUKAN lagi menyusun
+        sendiri "/api/download-file?url=...&filename=..." manual dari
+        downloadUrl mentah -> karena tanpa token yang benar, request
+        akan selalu ditolak 403 sekarang.
+      - Elemen <video>/<img> untuk PREVIEW tetap pakai downloadUrl /
+        audioUrl mentah seperti biasa (tidak butuh token, tidak lewat
+        Worker ini), konsisten dengan catatan di poin 10.
 ========================================================= */
 
 const app = new Hono();
@@ -817,30 +852,19 @@ function sanitizeFilename(name) {
   return cleaned || fallback;
 }
 
-// ---------- Validasi Origin/Referer (khusus /api/download-file) ----------
+// ---------- Validasi Origin/Referer (FALLBACK LAMA, lihat poin 12) ----------
+// Dipakai HANYA kalau DOWNLOAD_TOKEN_SECRET belum di-set di Worker.
 // CATATAN JUJUR soal batasan proteksi ini: header Origin/Referer memang
-// TIDAK BISA dipalsukan oleh JavaScript yang jalan di browser pengguna
-// biasa (browser sendiri yang mengunci nilainya saat request beneran
-// dikirim dari halaman kita) -> jadi ini efektif menolak bot/script
-// yang asal nembak URL endpoint ini dari LUAR situs kita.
-// TAPI ini BUKAN proteksi anti-pemalsuan sempurna: siapa pun yang manggil
-// endpoint ini langsung lewat tools seperti curl/Python requests/Postman
-// (bukan lewat browser sungguhan yang membuka situs kita) tetap BISA
-// menyetel header Origin/Referer itu ke nilai apa pun secara bebas, sama
-// seperti header HTTP lain. Kalau butuh proteksi yang benar-benar tidak
-// bisa dipalsukan sama sekali, itu perlu mekanisme lain (mis. signed
-// token/HMAC per-request dari /api/download), bukan sekadar cek header.
+// bisa TIDAK TERKIRIM SAMA SEKALI untuk request yang sah dari browser
+// (rel="noreferrer", Referrer-Policy: no-referrer, navigasi GET biasa
+// yang tidak selalu membawa Origin, ekstensi privasi, dst) -> makanya ini
+// cuma fallback, bukan proteksi utama lagi.
 function isRequestFromOwnSite(c) {
   const allowedOrigins = (c.env.ALLOWED_ORIGIN || '')
     .split(',')
     .map((o) => o.trim())
     .filter(Boolean);
 
-  // Kalau ALLOWED_ORIGIN belum di-set sama sekali di Worker, jangan
-  // "gagal terbuka" (meloloskan semua request tanpa cek) -> tapi juga
-  // jangan bikin fitur download mati total kalau admin lupa configure.
-  // Di sini kita log peringatan dan tetap loloskan, konsisten dengan
-  // constraint bahwa endpoint ini sudah dibatasi whitelist host media.
   if (allowedOrigins.length === 0) {
     console.warn(
       '[/api/download-file] ALLOWED_ORIGIN belum di-set -> validasi Origin/Referer dilewati.'
@@ -854,14 +878,100 @@ function isRequestFromOwnSite(c) {
   if (origin) {
     return allowedOrigins.includes(origin);
   }
-  // Beberapa browser tidak mengirim header Origin untuk navigasi GET
-  // biasa (klik link) -> fallback cek Referer, cukup cocokkan awalannya.
   if (referer) {
     return allowedOrigins.some((o) => referer.startsWith(o));
   }
-  // Tidak ada Origin maupun Referer sama sekali -> kemungkinan besar
-  // request langsung dari script, bukan dari klik link di situs kita.
   return false;
+}
+
+// ---------- Signed download token (HMAC-SHA256) — lihat poin 12 ----------
+// Menggantikan ketergantungan ke Origin/Referer yang tidak reliable.
+// Token mengikat { url, exp } dan ditandatangani pakai secret Worker,
+// jadi /api/download-file bisa memverifikasi bahwa request ini memang
+// hasil keluaran /api/download (yang sudah lewat Turnstile + rate limit),
+// bukan sekadar dicek dari header yang bisa hilang begitu saja.
+const DOWNLOAD_TOKEN_TTL_MS = 5 * 60 * 1000; // 5 menit, cukup buat klik "Unduh"
+
+function base64UrlEncode(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlDecodeToBytes(str) {
+  let normalized = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (normalized.length % 4) normalized += '=';
+  const binary = atob(normalized);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function hmacSignBase64Url(secret, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sigBuffer = await crypto.subtle.sign('HMAC', key, enc.encode(message));
+  return base64UrlEncode(new Uint8Array(sigBuffer));
+}
+
+// Bikin token untuk satu target URL media. Dipanggil dari /api/download
+// setelah normalisasi berhasil, sebelum response dikirim ke frontend.
+async function createDownloadToken(secret, targetUrl) {
+  const payloadJson = JSON.stringify({ url: targetUrl, exp: Date.now() + DOWNLOAD_TOKEN_TTL_MS });
+  const payloadB64 = base64UrlEncode(new TextEncoder().encode(payloadJson));
+  const signature = await hmacSignBase64Url(secret, payloadB64);
+  return `${payloadB64}.${signature}`;
+}
+
+// Verifikasi token dari /api/download-file. Return { ok: true } atau
+// { ok: false, reason } dengan pesan yang jelas buat user/log.
+async function verifyDownloadToken(secret, token, targetUrl) {
+  if (!token || typeof token !== 'string' || !token.includes('.')) {
+    return { ok: false, reason: 'Token unduhan tidak ada atau formatnya salah.' };
+  }
+
+  const [payloadB64, signature] = token.split('.');
+  if (!payloadB64 || !signature) {
+    return { ok: false, reason: 'Token unduhan tidak lengkap.' };
+  }
+
+  const expectedSignature = await hmacSignBase64Url(secret, payloadB64);
+
+  // Perbandingan waktu-konstan sederhana supaya tidak bocor info lewat
+  // timing (tidak sepenting di konteks ini, tapi murah untuk dilakukan).
+  if (expectedSignature.length !== signature.length) {
+    return { ok: false, reason: 'Token unduhan tidak valid.' };
+  }
+  let diff = 0;
+  for (let i = 0; i < expectedSignature.length; i++) {
+    diff |= expectedSignature.charCodeAt(i) ^ signature.charCodeAt(i);
+  }
+  if (diff !== 0) {
+    return { ok: false, reason: 'Token unduhan tidak valid.' };
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(base64UrlDecodeToBytes(payloadB64)));
+  } catch {
+    return { ok: false, reason: 'Token unduhan rusak.' };
+  }
+
+  if (!payload || typeof payload.exp !== 'number' || Date.now() > payload.exp) {
+    return { ok: false, reason: 'Token unduhan sudah kedaluwarsa. Ambil ulang link download.' };
+  }
+
+  if (payload.url !== targetUrl) {
+    return { ok: false, reason: 'Token unduhan tidak cocok dengan URL yang diminta.' };
+  }
+
+  return { ok: true };
 }
 
 // ---------- Endpoint download streaming (memaksa "Save As") ----------
@@ -870,25 +980,44 @@ function isRequestFromOwnSite(c) {
 // upstream.body (ReadableStream) diteruskan langsung ke browser, jadi
 // resource yang dipakai Worker tetap minim walau filenya besar -> tidak
 // mengulang error 1102 (resource limit) dari proxy lama.
+//
+// Proteksi utama sekarang: signed token (lihat poin 12) lewat query
+// `token`. Kalau DOWNLOAD_TOKEN_SECRET belum di-set di Worker, fallback
+// ke cek Origin/Referer lama (isRequestFromOwnSite) supaya endpoint
+// tidak langsung mati total, tapi ini TIDAK direkomendasikan produksi.
 app.get('/api/download-file', downloadLimiter, async (c) => {
   const targetUrl = c.req.query('url');
   const filename = sanitizeFilename(c.req.query('filename'));
-
-  if (!isRequestFromOwnSite(c)) {
-    console.warn(
-      '[/api/download-file] ditolak, Origin/Referer tidak dikenali:',
-      c.req.header('origin'),
-      c.req.header('referer')
-    );
-    return c.json(
-      { success: false, message: 'Permintaan hanya diizinkan dari situs Reelgrab.' },
-      403
-    );
-  }
+  const token = c.req.query('token');
+  const tokenSecret = c.env.DOWNLOAD_TOKEN_SECRET;
 
   if (!targetUrl) {
     return c.json({ success: false, message: 'Parameter url wajib diisi.' }, 400);
   }
+
+  if (tokenSecret) {
+    const tokenCheck = await verifyDownloadToken(tokenSecret, token, targetUrl);
+    if (!tokenCheck.ok) {
+      console.warn('[/api/download-file] token ditolak:', tokenCheck.reason, targetUrl);
+      return c.json({ success: false, message: tokenCheck.reason }, 403);
+    }
+  } else {
+    console.warn(
+      '[/api/download-file] DOWNLOAD_TOKEN_SECRET belum di-set -> fallback ke cek Origin/Referer (tidak direkomendasikan).'
+    );
+    if (!isRequestFromOwnSite(c)) {
+      console.warn(
+        '[/api/download-file] ditolak, Origin/Referer tidak dikenali:',
+        c.req.header('origin'),
+        c.req.header('referer')
+      );
+      return c.json(
+        { success: false, message: 'Permintaan hanya diizinkan dari situs Reelgrab.' },
+        403
+      );
+    }
+  }
+
   if (!isAllowedMediaUrl(targetUrl)) {
     console.warn('[/api/download-file] host ditolak whitelist:', targetUrl);
     return c.json({ success: false, message: 'Sumber media tidak diizinkan.' }, 403);
@@ -996,15 +1125,49 @@ app.post('/api/download', downloadLimiter, async (c) => {
       return c.json({ success: false, message }, 404);
     }
 
+    // ---------- Bikin signed download URL (lihat poin 12) ----------
+    // downloadUrl / audioUrl tetap dikirim mentah seperti biasa (dipakai
+    // untuk <video src>/<img src> preview, tidak lewat Worker ini).
+    // downloadFileUrl / audioDownloadFileUrl BARU: URL absolut siap-pakai
+    // ke /api/download-file, sudah termasuk token yang valid -> ini yang
+    // WAJIB dipakai frontend untuk href tombol "Unduh".
+    const tokenSecret = c.env.DOWNLOAD_TOKEN_SECRET;
+    const workerOrigin = new URL(c.req.url).origin;
+    const baseTitle = normalized.title || 'reelgrab-download';
+
+    async function buildDownloadFileUrl(mediaUrl, extHint) {
+      if (!mediaUrl) return null;
+      const params = new URLSearchParams();
+      params.set('url', mediaUrl);
+      params.set('filename', `${sanitizeFilename(baseTitle)}${extHint}`);
+      if (tokenSecret) {
+        const token = await createDownloadToken(tokenSecret, mediaUrl);
+        params.set('token', token);
+      } else {
+        console.warn(
+          '[/api/download] DOWNLOAD_TOKEN_SECRET belum di-set -> downloadFileUrl dibuat tanpa token (fallback Origin/Referer lama akan dipakai).'
+        );
+      }
+      return `${workerOrigin}/api/download-file?${params.toString()}`;
+    }
+
+    const downloadFileUrl = await buildDownloadFileUrl(
+      normalized.downloadUrl,
+      normalized.isVideo === false ? '.jpg' : '.mp4'
+    );
+    const audioDownloadFileUrl = await buildDownloadFileUrl(normalized.audioUrl, '.mp3');
+
     // downloadUrl / audioUrl di sini adalah URL ASLI dari sumber
     // (dl.tiktokio.com, cdninstagram.com, i.pinimg.com, dst.) -> tidak
     // lagi dibungkus lewat /api/proxy (lihat catatan poin 9 di header).
-    // Frontend tinggal pakai langsung untuk <video src>, <audio src>,
-    // atau <a download href>.
+    // Frontend pakai downloadUrl/audioUrl untuk preview, dan
+    // downloadFileUrl/audioDownloadFileUrl untuk tombol "Unduh".
     return c.json({
       success: true,
       data: {
         ...normalized,
+        downloadFileUrl,
+        audioDownloadFileUrl,
         removeWatermark: !!removeWatermark,
       },
     });
