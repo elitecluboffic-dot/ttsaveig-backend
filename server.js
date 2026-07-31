@@ -47,27 +47,36 @@ import { cors } from 'hono/cors';
         app.onError() global, dan whitelist CDN diperluas untuk
         menutup lebih banyak variasi subdomain thumbnail.
 
-   6) X/TWITTER — IMPLEMENTASI PENUH (update ini):
-      - xdl() sekarang mencoba BEBERAPA nama endpoint di backend
-        pihak ketiga secara berurutan ('twitter', 'twitterdl', 'x'),
-        karena nama fungsi resmi btch-downloader untuk X kadang beda
+   6) PINTEREST — MENGGANTIKAN X/TWITTER (update ini):
+      - Dukungan X/Twitter dicabut sepenuhnya dan digantikan dengan
+        Pinterest, karena backend pihak ketiga jauh lebih stabil untuk
+        Pinterest dan kebutuhan user lebih sering ke arah situ.
+      - pindl() mencoba BEBERAPA nama endpoint di backend pihak
+        ketiga secara berurutan ('pinterest', 'pindl', 'pin'), karena
+        nama fungsi resmi btch-downloader untuk Pinterest kadang beda
         antara versi lib dan versi backend HTTP-nya. Berhenti di
         percobaan pertama yang sukses (HTTP 200 & bukan JSON kosong).
-      - normalizeTwitter() dirombak jadi jauh lebih tahan banting:
-        mendukung bentuk respons sebagai object langsung, array of
-        items, atau object berisi daftar "media"/"variants"/"videos"
-        dengan banyak kualitas berbeda (dipilih bitrate/quality
-        tertinggi otomatis). Juga mendukung struktur bersarang umum
-        di scraper Twitter seperti { url: { hd, sd } } atau
-        { thumbnail: { url } }.
+      - normalizePinterest() dibuat tahan banting: mendukung bentuk
+        respons sebagai object langsung, array of items, ATAU object
+        berisi daftar "media"/"images"/"videos" dengan banyak kualitas
+        berbeda (dipilih resolusi/bitrate tertinggi otomatis). Juga
+        mendukung struktur bersarang umum di scraper Pinterest seperti
+        { video: { url } }, { images: { orig: { url } } }, atau
+        { url: { hd, sd } }. Pinterest sering hanya berupa gambar
+        (pin foto biasa) -> kalau tidak ada video sama sekali, otomatis
+        fallback ke gambar resolusi tertinggi sebagai downloadUrl.
       - Kalau SEMUA percobaan endpoint gagal atau hasil parsing tetap
         kosong, pesan error ke user dibuat lebih spesifik (beda dari
-        pesan generik "video tidak ditemukan") supaya jelas bahwa X
-        kemungkinan sedang tidak didukung backend pihak ketiga,
-        bukan link-nya yang salah.
+        pesan generik "video tidak ditemukan") supaya jelas bahwa
+        Pinterest kemungkinan sedang tidak didukung backend pihak
+        ketiga, bukan link-nya yang salah.
       - Ditambahkan log raw response (dipotong biar gak kepanjangan)
         di console.error saat parsing gagal, supaya gampang di-debug
-        lewat `wrangler tail` kalau ada laporan link X yang gagal.
+        lewat `wrangler tail` kalau ada laporan link Pinterest yang
+        gagal.
+      - Whitelist host media diperbarui: *.pinimg.com (CDN gambar &
+        video Pinterest) ditambahkan, *.twimg.com dicabut karena sudah
+        tidak dipakai.
 ========================================================= */
 
 const app = new Hono();
@@ -163,10 +172,10 @@ async function igdl(url) {
   return btchGet('igdl', url);
 }
 
-// X/Twitter: nama endpoint resmi di backend pihak ketiga belum
+// Pinterest: nama endpoint resmi di backend pihak ketiga belum
 // terverifikasi 100% dan bisa beda antar versi -> coba beberapa
 // kandidat nama secara berurutan, pakai yang pertama berhasil.
-const TWITTER_ENDPOINT_CANDIDATES = ['twitter', 'twitterdl', 'x', 'xdl'];
+const PINTEREST_ENDPOINT_CANDIDATES = ['pinterest', 'pindl', 'pin'];
 
 function isEmptyResult(raw) {
   if (raw == null) return true;
@@ -176,10 +185,10 @@ function isEmptyResult(raw) {
   return false;
 }
 
-async function xdl(url) {
+async function pindl(url) {
   const errors = [];
 
-  for (const endpoint of TWITTER_ENDPOINT_CANDIDATES) {
+  for (const endpoint of PINTEREST_ENDPOINT_CANDIDATES) {
     try {
       const raw = await btchGet(endpoint, url);
       if (!isEmptyResult(raw)) {
@@ -193,7 +202,7 @@ async function xdl(url) {
 
   // Semua kandidat endpoint gagal -> lempar error gabungan supaya
   // ketahuan di log endpoint mana saja yang sudah dicoba.
-  throw new Error(`Semua endpoint X/Twitter gagal -> ${errors.join(' | ')}`);
+  throw new Error(`Semua endpoint Pinterest gagal -> ${errors.join(' | ')}`);
 }
 
 // ---------- Helper functions ----------
@@ -211,8 +220,12 @@ function isValidPlatformUrl(url, platform) {
     if (platform === 'instagram') {
       return /(^|\.)instagram\.com$/.test(host);
     }
-    if (platform === 'x') {
-      return /(^|\.)twitter\.com$/.test(host) || /(^|\.)x\.com$/.test(host);
+    if (platform === 'pinterest') {
+      return (
+        /(^|\.)pinterest\.com$/.test(host) ||
+        /(^|\.)pinterest\.[a-z.]+$/.test(host) || // domain regional, mis. pinterest.co.uk, pinterest.de
+        /(^|\.)pin\.it$/.test(host)
+      );
     }
     return false;
   } catch {
@@ -245,6 +258,8 @@ function unwrapUrlValue(value) {
     return (
       unwrapUrlValue(value.hd) ||
       unwrapUrlValue(value.sd) ||
+      unwrapUrlValue(value.orig) ||
+      unwrapUrlValue(value.original) ||
       unwrapUrlValue(value.url) ||
       unwrapUrlValue(value.link) ||
       null
@@ -292,26 +307,29 @@ function normalizeInstagram(raw) {
   };
 }
 
-// Skor kualitas kandidat varian video X/Twitter, dipakai untuk
-// milih varian bitrate/resolusi tertinggi kalau ada beberapa.
+// Skor kualitas kandidat varian media Pinterest (video/gambar), dipakai
+// untuk milih varian resolusi/bitrate tertinggi kalau ada beberapa.
 function variantQualityScore(variant) {
   if (!variant || typeof variant !== 'object') return 0;
   const bitrate = Number(variant.bitrate) || 0;
   const quality = Number(variant.quality) || 0;
   const height = Number(variant.height) || 0;
   const width = Number(variant.width) || 0;
-  // Bitrate biasanya paling representatif buat video Twitter (dalam bps),
-  // fallback ke quality/resolusi kalau bitrate tidak ada.
+  // Bitrate paling representatif buat video, fallback ke quality atau
+  // resolusi (height x width) kalau bitrate tidak ada -> ini juga
+  // cocok dipakai buat bandingin ukuran gambar Pinterest (orig vs 236x dst).
   return bitrate || quality * 1000 || height * width || 0;
 }
 
-// Cari daftar varian video di berbagai kemungkinan struktur response.
-function extractTwitterVariants(item) {
+// Cari daftar varian video/gambar Pinterest di berbagai kemungkinan
+// struktur response (video_list, images multi-resolusi, dst).
+function extractPinterestVariants(item) {
   const candidates = pickFirst(item, [
     'variants',
     'media',
     'medias',
     'videos',
+    'video_list',
     'video_versions',
     'formats',
   ]);
@@ -320,40 +338,85 @@ function extractTwitterVariants(item) {
   // Kadang video ada di dalam item.video.variants atau item.media.videos
   const nestedVideo = item && (item.video || item.media);
   if (nestedVideo && typeof nestedVideo === 'object') {
-    const nested = pickFirst(nestedVideo, ['variants', 'videos', 'formats']);
+    const nested = pickFirst(nestedVideo, ['variants', 'videos', 'formats', 'video_list']);
     if (Array.isArray(nested) && nested.length) return nested;
   }
 
   return [];
 }
 
-// Parser fleksibel untuk X/Twitter — dirancang untuk menangani banyak
+// Cari daftar varian GAMBAR Pinterest kalau pin-nya berupa foto biasa
+// (bukan video). Banyak scraper Pinterest mengembalikan objek "images"
+// berisi beberapa resolusi, mis. { orig, "736x", "236x" }.
+function extractPinterestImages(item) {
+  const imagesObj = pickFirst(item, ['images', 'image']);
+  if (!imagesObj) return [];
+
+  if (typeof imagesObj === 'string') return [{ url: imagesObj }];
+
+  if (typeof imagesObj === 'object' && !Array.isArray(imagesObj)) {
+    // Object berisi beberapa key resolusi -> ubah jadi array supaya
+    // bisa diskor & disortir sama seperti varian video.
+    return Object.entries(imagesObj).map(([key, val]) => {
+      const url = unwrapUrlValue(val);
+      const dims = /(\d+)x(\d+)?/.exec(key) || [];
+      return {
+        url,
+        width: val && val.width ? Number(val.width) : dims[1] ? Number(dims[1]) : 0,
+        height: val && val.height ? Number(val.height) : dims[2] ? Number(dims[2]) : 0,
+        // "orig" dianggap resolusi tertinggi
+        quality: key === 'orig' || key === 'original' ? 99999 : 0,
+      };
+    });
+  }
+
+  if (Array.isArray(imagesObj)) return imagesObj;
+
+  return [];
+}
+
+// Parser fleksibel untuk Pinterest — dirancang untuk menangani banyak
 // kemungkinan bentuk respons dari backend pihak ketiga, karena bentuk
 // pastinya belum terdokumentasi resmi. Lihat catatan (6) di header.
-function normalizeTwitter(raw) {
+// Pinterest bisa berupa VIDEO (pin video/idea pin) atau cuma GAMBAR
+// (pin foto biasa) -> keduanya ditangani di sini.
+function normalizePinterest(raw) {
   if (!raw) return null;
 
   // Kalau raw berupa array, ambil item pertama yang kelihatan valid.
   const item = Array.isArray(raw)
     ? raw.find((i) =>
-        pickFirst(i, ['url', 'video', 'download_url', 'play', 'media', 'variants', 'videos'])
+        pickFirst(i, [
+          'url',
+          'video',
+          'download_url',
+          'media',
+          'variants',
+          'videos',
+          'images',
+          'image',
+        ])
       )
     : raw;
   if (!item) return null;
 
+  let downloadUrl = null;
+  let isVideo = false;
+
   // Kemungkinan 1: field video/url langsung berupa string, array, atau
   // object bersarang seperti { hd, sd }.
-  let downloadUrl = unwrapUrlValue(
-    pickFirst(item, ['url', 'video', 'download_url', 'play', 'hd', 'sd'])
+  const directUrl = unwrapUrlValue(
+    pickFirst(item, ['url', 'video', 'download_url', 'hd', 'sd'])
   );
+  if (directUrl) {
+    downloadUrl = directUrl;
+    isVideo = /\.mp4(\?|$)/i.test(directUrl) || !!pickFirst(item, ['video', 'video_list']);
+  }
 
-  // Kemungkinan 2: ada daftar varian kualitas berbeda -> pilih terbaik.
+  // Kemungkinan 2: ada daftar varian video kualitas berbeda -> pilih terbaik.
   if (!downloadUrl) {
-    const variants = extractTwitterVariants(item);
+    const variants = extractPinterestVariants(item);
     if (variants.length) {
-      // Cuma pertimbangkan varian yang benar-benar video (content_type
-      // mp4 kalau infonya ada), abaikan varian m3u8/playlist kalau
-      // ada alternatif mp4 langsung.
       const mp4Variants = variants.filter((v) => {
         const type = (v && (v.content_type || v.type || v.mimeType)) || '';
         return !type || /mp4/i.test(type);
@@ -366,23 +429,38 @@ function normalizeTwitter(raw) {
       downloadUrl = unwrapUrlValue(
         pickFirst(sorted[0] || {}, ['url', 'video', 'download_url', 'src'])
       );
+      if (downloadUrl) isVideo = true;
+    }
+  }
+
+  // Kemungkinan 3: pin tanpa video sama sekali -> fallback ke gambar
+  // resolusi tertinggi yang tersedia.
+  if (!downloadUrl) {
+    const images = extractPinterestImages(item);
+    if (images.length) {
+      const sorted = [...images].sort(
+        (a, b) => variantQualityScore(b) - variantQualityScore(a)
+      );
+      downloadUrl = unwrapUrlValue(pickFirst(sorted[0] || {}, ['url', 'src']));
+      isVideo = false;
     }
   }
 
   if (!downloadUrl) return null;
 
-  const thumbnail = unwrapUrlValue(
-    pickFirst(item, ['thumbnail', 'cover', 'image', 'preview', 'poster'])
-  );
-  const title = pickFirst(item, ['title', 'text', 'caption', 'desc']);
-  const author = pickFirst(item, ['author', 'username', 'user', 'nickname']);
+  const thumbnail =
+    unwrapUrlValue(pickFirst(item, ['thumbnail', 'cover', 'preview', 'poster'])) ||
+    (!isVideo ? downloadUrl : '');
+  const title = pickFirst(item, ['title', 'grid_title', 'text', 'caption', 'desc']);
+  const author = pickFirst(item, ['author', 'username', 'user', 'pinner']);
 
   return {
-    title: title || 'Video X (Twitter)',
+    title: title || (isVideo ? 'Video Pinterest' : 'Gambar Pinterest'),
     author: author || '',
     thumbnail: thumbnail || '',
     downloadUrl,
     audioUrl: null,
+    isVideo,
   };
 }
 
@@ -400,12 +478,15 @@ app.post('/api/download', downloadLimiter, async (c) => {
   if (!url || !platform) {
     return c.json({ success: false, message: 'url dan platform wajib diisi.' }, 400);
   }
-  if (!['tiktok', 'instagram', 'x'].includes(platform)) {
-    return c.json({ success: false, message: 'platform harus "tiktok", "instagram", atau "x".' }, 400);
+  if (!['tiktok', 'instagram', 'pinterest'].includes(platform)) {
+    return c.json(
+      { success: false, message: 'platform harus "tiktok", "instagram", atau "pinterest".' },
+      400
+    );
   }
   if (!isValidPlatformUrl(url, platform)) {
     const platformLabel =
-      platform === 'tiktok' ? 'TikTok' : platform === 'instagram' ? 'Instagram' : 'X (Twitter)';
+      platform === 'tiktok' ? 'TikTok' : platform === 'instagram' ? 'Instagram' : 'Pinterest';
     return c.json(
       { success: false, message: `Link ini bukan link ${platformLabel} yang valid.` },
       400
@@ -424,21 +505,21 @@ app.post('/api/download', downloadLimiter, async (c) => {
       const raw = await igdl(url);
       normalized = normalizeInstagram(raw);
     } else {
-      const raw = await xdl(url);
-      normalized = normalizeTwitter(raw);
+      const raw = await pindl(url);
+      normalized = normalizePinterest(raw);
 
       if (!normalized) {
         // Log raw response (dipotong) supaya gampang di-debug lewat
-        // `wrangler tail` kalau ada laporan link X yang gagal parse.
+        // `wrangler tail` kalau ada laporan link Pinterest yang gagal parse.
         const rawPreview = JSON.stringify(raw).slice(0, 500);
-        console.error('[/api/download] gagal parse respons X/Twitter:', rawPreview);
+        console.error('[/api/download] gagal parse respons Pinterest:', rawPreview);
       }
     }
 
     if (!normalized || (!normalized.downloadUrl && !normalized.audioUrl)) {
       const message =
-        platform === 'x'
-          ? 'Video X (Twitter) tidak ditemukan atau formatnya belum didukung. Pastikan link publik dan berupa video (bukan post foto/teks saja).'
+        platform === 'pinterest'
+          ? 'Pin Pinterest tidak ditemukan atau formatnya belum didukung. Pastikan link publik dan pin masih tersedia.'
           : 'Video tidak ditemukan. Pastikan link publik (bukan akun privat) dan masih tersedia.';
       return c.json({ success: false, message }, 404);
     }
@@ -482,8 +563,9 @@ const ALLOWED_MEDIA_HOSTS = [
   // Instagram / Facebook CDN (thumbnail & video sama-sama di sini)
   /(^|\.)cdninstagram\.com$/,
   /(^|\.)fbcdn\.net$/,
-  // X / Twitter - video & thumbnail sama-sama di *.twimg.com
-  /(^|\.)twimg\.com$/,
+  // Pinterest - gambar & video sama-sama di *.pinimg.com (mis. i.pinimg.com,
+  // v1.pinimg.com, v.pinimg.com, s.pinimg.com)
+  /(^|\.)pinimg\.com$/,
   // backend pihak ketiga yang dipakai
   /(^|\.)tioo\.eu\.org$/,
 ];
