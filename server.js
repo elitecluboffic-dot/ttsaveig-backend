@@ -170,6 +170,35 @@ import { cors } from 'hono/cors';
         isAllowedMediaUrl() dihidupkan lagi khusus untuk endpoint ini,
         supaya Worker tidak menjadi open proxy yang bisa dipakai
         mendownload file dari domain sembarangan.
+
+   11) PROTEKSI /api/download-file SUPAYA TIDAK BISA DIPANGGIL DARI LUAR
+       SITUS (update ini):
+      - /api/download-file sebelumnya bisa dipanggil dari mana saja
+        selama URL targetnya lolos whitelist host -> siapa pun yang tahu
+        pola URL-nya bisa numpang bandwidth situs ini tanpa lewat form
+        atau captcha Turnstile sama sekali.
+      - Solusi: ditambahkan isRequestFromOwnSite() yang mencocokkan
+        header Origin (atau fallback ke Referer kalau Origin kosong,
+        karena beberapa browser tidak selalu mengirim Origin untuk
+        navigasi GET biasa) terhadap daftar ALLOWED_ORIGIN yang sama
+        dipakai middleware CORS di atas. Request tanpa Origin/Referer
+        yang cocok ditolak dengan 403.
+      - downloadLimiter (limit 20/menit per IP, sama seperti
+        /api/download) juga diterapkan ke endpoint ini, yang
+        sebelumnya cuma kena globalLimiter (60/menit).
+      - BATASAN PENTING yang perlu disadari: header Origin/Referer TIDAK
+        BISA dipalsukan oleh JavaScript yang berjalan di browser
+        pengguna biasa (browser sendiri yang mengunci nilainya), jadi
+        ini efektif menolak bot/script yang asal menembak URL endpoint
+        dari luar situs. TAPI siapa pun yang memanggil endpoint ini
+        langsung lewat tools seperti curl/Python requests/Postman
+        (bukan lewat browser yang benar-benar membuka situs kita) tetap
+        BISA menyetel header itu ke nilai apa pun secara bebas -> ini
+        BUKAN proteksi anti-pemalsuan yang sempurna. Kalau suatu saat
+        butuh proteksi yang benar-benar tidak bisa dipalsukan sama
+        sekali, itu perlu mekanisme lain (mis. signed token/HMAC
+        per-request yang dibuat oleh /api/download dan diverifikasi di
+        sini), bukan sekadar mengandalkan header Origin/Referer.
 ========================================================= */
 
 const app = new Hono();
@@ -788,15 +817,74 @@ function sanitizeFilename(name) {
   return cleaned || fallback;
 }
 
+// ---------- Validasi Origin/Referer (khusus /api/download-file) ----------
+// CATATAN JUJUR soal batasan proteksi ini: header Origin/Referer memang
+// TIDAK BISA dipalsukan oleh JavaScript yang jalan di browser pengguna
+// biasa (browser sendiri yang mengunci nilainya saat request beneran
+// dikirim dari halaman kita) -> jadi ini efektif menolak bot/script
+// yang asal nembak URL endpoint ini dari LUAR situs kita.
+// TAPI ini BUKAN proteksi anti-pemalsuan sempurna: siapa pun yang manggil
+// endpoint ini langsung lewat tools seperti curl/Python requests/Postman
+// (bukan lewat browser sungguhan yang membuka situs kita) tetap BISA
+// menyetel header Origin/Referer itu ke nilai apa pun secara bebas, sama
+// seperti header HTTP lain. Kalau butuh proteksi yang benar-benar tidak
+// bisa dipalsukan sama sekali, itu perlu mekanisme lain (mis. signed
+// token/HMAC per-request dari /api/download), bukan sekadar cek header.
+function isRequestFromOwnSite(c) {
+  const allowedOrigins = (c.env.ALLOWED_ORIGIN || '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+
+  // Kalau ALLOWED_ORIGIN belum di-set sama sekali di Worker, jangan
+  // "gagal terbuka" (meloloskan semua request tanpa cek) -> tapi juga
+  // jangan bikin fitur download mati total kalau admin lupa configure.
+  // Di sini kita log peringatan dan tetap loloskan, konsisten dengan
+  // constraint bahwa endpoint ini sudah dibatasi whitelist host media.
+  if (allowedOrigins.length === 0) {
+    console.warn(
+      '[/api/download-file] ALLOWED_ORIGIN belum di-set -> validasi Origin/Referer dilewati.'
+    );
+    return true;
+  }
+
+  const origin = c.req.header('origin');
+  const referer = c.req.header('referer');
+
+  if (origin) {
+    return allowedOrigins.includes(origin);
+  }
+  // Beberapa browser tidak mengirim header Origin untuk navigasi GET
+  // biasa (klik link) -> fallback cek Referer, cukup cocokkan awalannya.
+  if (referer) {
+    return allowedOrigins.some((o) => referer.startsWith(o));
+  }
+  // Tidak ada Origin maupun Referer sama sekali -> kemungkinan besar
+  // request langsung dari script, bukan dari klik link di situs kita.
+  return false;
+}
+
 // ---------- Endpoint download streaming (memaksa "Save As") ----------
 // Berbeda dari /api/proxy versi lama (poin 3-5, sudah dihapus di poin 9):
 // endpoint ini TIDAK membuffer seluruh isi file ke memory Worker.
 // upstream.body (ReadableStream) diteruskan langsung ke browser, jadi
 // resource yang dipakai Worker tetap minim walau filenya besar -> tidak
 // mengulang error 1102 (resource limit) dari proxy lama.
-app.get('/api/download-file', async (c) => {
+app.get('/api/download-file', downloadLimiter, async (c) => {
   const targetUrl = c.req.query('url');
   const filename = sanitizeFilename(c.req.query('filename'));
+
+  if (!isRequestFromOwnSite(c)) {
+    console.warn(
+      '[/api/download-file] ditolak, Origin/Referer tidak dikenali:',
+      c.req.header('origin'),
+      c.req.header('referer')
+    );
+    return c.json(
+      { success: false, message: 'Permintaan hanya diizinkan dari situs Reelgrab.' },
+      403
+    );
+  }
 
   if (!targetUrl) {
     return c.json({ success: false, message: 'Parameter url wajib diisi.' }, 400);
