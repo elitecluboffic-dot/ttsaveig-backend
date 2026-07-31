@@ -77,6 +77,31 @@ import { cors } from 'hono/cors';
       - Whitelist host media diperbarui: *.pinimg.com (CDN gambar &
         video Pinterest) ditambahkan, *.twimg.com dicabut karena sudah
         tidak dipakai.
+
+   7) FIX "Pin Pinterest tidak ditemukan" PADAHAL PIN-NYA ADA (update ini):
+      - Dikonfirmasi lewat dokumentasi resmi btch-downloader bahwa nama
+        fungsi/endpoint untuk Pinterest memang persis 'pinterest' (sudah
+        jadi kandidat pertama di PINTEREST_ENDPOINT_CANDIDATES, jadi
+        bukan itu masalahnya).
+      - Root cause paling mungkin: normalizePinterest() sebelumnya
+        cuma cari field di level teratas object, padahal beberapa
+        respons backend membungkus payload asli di dalam container
+        seperti { data: {...} }, { result: {...} }, atau { pin: {...} }.
+      - Solusi: ditambahkan unwrapContainer() yang membongkar satu
+        lapis pembungkus itu sebelum parsing field lain. Juga
+        ditambahkan penanganan kalau raw (atau item di dalam array)
+        ternyata cuma berupa STRING URL polos, dan daftar nama field
+        URL/thumbnail/title/author diperluas (contentUrl, direct_url,
+        download, image_url, dst.) supaya lebih toleran terhadap
+        variasi penamaan.
+      - CATATAN PENTING: kalau setelah update ini link Pinterest masih
+        gagal (404 "tidak ditemukan"), kemungkinan bentuk respons
+        backend memang di luar semua pola yang sudah ditangani di
+        atas. Jalankan `wrangler tail` sambil coba link yang gagal,
+        lalu lihat baris log '[/api/download] gagal parse respons
+        Pinterest:' — isi JSON di baris itu adalah bentuk respons
+        ASLI dari backend, dan itulah yang dibutuhkan untuk
+        menyesuaikan normalizePinterest() secara presisi.
 ========================================================= */
 
 const app = new Hono();
@@ -375,18 +400,49 @@ function extractPinterestImages(item) {
   return [];
 }
 
+// Beberapa backend membungkus payload asli di dalam key container
+// seperti { success, data: {...} }, { status, result: {...} }, atau
+// { pin: {...} }. Bongkar satu lapis pembungkus ini kalau ada, supaya
+// pencarian field di bawah tidak meleset karena field-nya sebenarnya
+// bersarang satu level lebih dalam.
+function unwrapContainer(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+  const container = pickFirst(raw, ['data', 'result', 'results', 'pin', 'payload']);
+  if (container && (typeof container === 'object' || typeof container === 'string')) {
+    return container;
+  }
+  return raw;
+}
+
 // Parser fleksibel untuk Pinterest — dirancang untuk menangani banyak
 // kemungkinan bentuk respons dari backend pihak ketiga, karena bentuk
 // pastinya belum terdokumentasi resmi. Lihat catatan (6) di header.
 // Pinterest bisa berupa VIDEO (pin video/idea pin) atau cuma GAMBAR
 // (pin foto biasa) -> keduanya ditangani di sini.
-function normalizePinterest(raw) {
-  if (!raw) return null;
+function normalizePinterest(rawInput) {
+  if (!rawInput) return null;
+
+  // Kasus paling sederhana: backend langsung balikin string URL media.
+  if (typeof rawInput === 'string') {
+    const trimmed = rawInput.trim();
+    if (!trimmed) return null;
+    return {
+      title: 'Media Pinterest',
+      author: '',
+      thumbnail: '',
+      downloadUrl: trimmed,
+      audioUrl: null,
+      isVideo: /\.mp4(\?|$)/i.test(trimmed),
+    };
+  }
+
+  const raw = unwrapContainer(rawInput);
 
   // Kalau raw berupa array, ambil item pertama yang kelihatan valid.
   const item = Array.isArray(raw)
-    ? raw.find((i) =>
-        pickFirst(i, [
+    ? raw.find((i) => {
+        if (typeof i === 'string') return i.trim().length > 0;
+        return pickFirst(i, [
           'url',
           'video',
           'download_url',
@@ -395,22 +451,53 @@ function normalizePinterest(raw) {
           'videos',
           'images',
           'image',
-        ])
-      )
+        ]);
+      })
     : raw;
   if (!item) return null;
+
+  // Item di dalam array bisa jadi juga cuma string URL polos.
+  if (typeof item === 'string') {
+    return {
+      title: 'Media Pinterest',
+      author: '',
+      thumbnail: '',
+      downloadUrl: item,
+      audioUrl: null,
+      isVideo: /\.mp4(\?|$)/i.test(item),
+    };
+  }
 
   let downloadUrl = null;
   let isVideo = false;
 
   // Kemungkinan 1: field video/url langsung berupa string, array, atau
-  // object bersarang seperti { hd, sd }.
+  // object bersarang seperti { hd, sd }. Daftar nama field diperluas
+  // karena beberapa versi backend memakai penamaan yang berbeda-beda
+  // (contentUrl, direct_url, high_quality, download, src, dst.).
   const directUrl = unwrapUrlValue(
-    pickFirst(item, ['url', 'video', 'download_url', 'hd', 'sd'])
+    pickFirst(item, [
+      'url',
+      'video',
+      'download_url',
+      'downloadUrl',
+      'direct_url',
+      'directUrl',
+      'download',
+      'contentUrl',
+      'content_url',
+      'src',
+      'high_quality',
+      'highQuality',
+      'hd',
+      'sd',
+    ])
   );
   if (directUrl) {
     downloadUrl = directUrl;
-    isVideo = /\.mp4(\?|$)/i.test(directUrl) || !!pickFirst(item, ['video', 'video_list']);
+    isVideo =
+      /\.mp4(\?|$)/i.test(directUrl) ||
+      !!pickFirst(item, ['video', 'video_list', 'videos']);
   }
 
   // Kemungkinan 2: ada daftar varian video kualitas berbeda -> pilih terbaik.
@@ -449,10 +536,19 @@ function normalizePinterest(raw) {
   if (!downloadUrl) return null;
 
   const thumbnail =
-    unwrapUrlValue(pickFirst(item, ['thumbnail', 'cover', 'preview', 'poster'])) ||
-    (!isVideo ? downloadUrl : '');
-  const title = pickFirst(item, ['title', 'grid_title', 'text', 'caption', 'desc']);
-  const author = pickFirst(item, ['author', 'username', 'user', 'pinner']);
+    unwrapUrlValue(
+      pickFirst(item, ['thumbnail', 'thumb', 'cover', 'preview', 'poster', 'image_url', 'imageUrl'])
+    ) || (!isVideo ? downloadUrl : '');
+  const title = pickFirst(item, [
+    'title',
+    'grid_title',
+    'gridTitle',
+    'text',
+    'caption',
+    'desc',
+    'description',
+  ]);
+  const author = pickFirst(item, ['author', 'username', 'user', 'pinner', 'creator']);
 
   return {
     title: title || (isVideo ? 'Video Pinterest' : 'Gambar Pinterest'),
