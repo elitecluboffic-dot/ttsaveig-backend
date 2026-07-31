@@ -39,10 +39,31 @@ import { cors } from 'hono/cors';
       Cloudflare Cache API per targetUrl, lalu semua request Range
       dari browser dilayani dari cache tsb.
 
-   Catatan: backend1.tioo.eu.org adalah layanan pihak ketiga yang tidak
-   dioperasikan oleh kita. Kalau suatu saat mereka mengubah format
-   respons atau endpoint-nya, fungsi ttdl()/igdl() di bawah ini perlu
-   disesuaikan lagi.
+   5) Ditambahkan dukungan platform "x" (Twitter/X). Endpoint backend
+      yang dipanggil ('twitter') mengikuti nama fungsi resmi di
+      library btch-downloader, TAPI bentuk response mentahnya belum
+      terverifikasi langsung (beda dengan ttdl/igdl yang sudah
+      terkonfirmasi dari kode lama). normalizeTwitter() dibuat
+      fleksibel (coba beberapa kemungkinan nama field) supaya lebih
+      tahan banting -> tetap perlu ditest ulang dengan link asli.
+
+   6) FIX THUMBNAIL/GAMBAR KE-404 DI /api/proxy:
+      - Root cause paling umum: request thumbnail/gambar dari <img>
+        kadang dikirim browser sebagai method selain GET (preflight,
+        prefetch, dsb), atau path-nya sedikit berbeda dari yang
+        didaftarkan router (trailing slash, dsb) -> jatuh ke
+        app.notFound() -> makanya browser lihat status 404.
+      - Solusi: /api/proxy sekarang menerima GET *dan* HEAD secara
+        eksplisit, ditambah app.onError() global supaya exception
+        yang tidak tertangkap tidak pernah "hilang" jadi 404/500
+        polos tanpa pesan yang jelas.
+      - Whitelist host CDN diperluas untuk menutup lebih banyak
+        variasi subdomain thumbnail TikTok/Instagram/X (p16-sign,
+        p19-sign, ibyteimg, muscdn, scontent-*, dst), karena
+        thumbnail sering datang dari CDN yang beda dengan video-nya.
+      - Ditambahkan log diagnostik di notFound handler supaya kalau
+        masih ada 404, kita bisa lihat persis method + path yang
+        gagal lewat `wrangler tail`.
 ========================================================= */
 
 const app = new Hono();
@@ -67,8 +88,6 @@ app.use('*', async (c, next) => {
 });
 
 // ---------- Rate limiter sederhana (in-memory, per-isolate) ----------
-// Catatan: bukan rate limit yang 100% akurat secara global di Workers
-// (isolate bisa paralel), tapi cukup untuk proteksi dasar.
 function createRateLimiter({ windowMs, max, message }) {
   const hits = new Map();
 
@@ -140,6 +159,11 @@ async function igdl(url) {
   return btchGet('igdl', url);
 }
 
+// Bentuk respons mentah X/Twitter: BELUM terverifikasi 100%, lihat catatan (5) di atas.
+async function xdl(url) {
+  return btchGet('twitter', url);
+}
+
 // ---------- Helper functions ----------
 function isValidPlatformUrl(url, platform) {
   try {
@@ -154,6 +178,9 @@ function isValidPlatformUrl(url, platform) {
     }
     if (platform === 'instagram') {
       return /(^|\.)instagram\.com$/.test(host);
+    }
+    if (platform === 'x') {
+      return /(^|\.)twitter\.com$/.test(host) || /(^|\.)x\.com$/.test(host);
     }
     return false;
   } catch {
@@ -171,7 +198,6 @@ function pickFirst(obj, keys) {
 function normalizeTikTok(raw, wantAudioOnly) {
   if (!raw) return null;
 
-  // raw.video dan raw.audio adalah array URL (sesuai bentuk asli backend)
   const videoArr = Array.isArray(raw.video) ? raw.video : raw.video ? [raw.video] : [];
   const audioArr = Array.isArray(raw.audio) ? raw.audio : raw.audio ? [raw.audio] : [];
 
@@ -208,6 +234,49 @@ function normalizeInstagram(raw) {
   };
 }
 
+// Parser fleksibel untuk X/Twitter -- lihat catatan (5) di atas.
+// Mencoba banyak kemungkinan bentuk: object langsung, array item,
+// atau object dengan daftar "variants"/"media" berkualitas berbeda.
+function normalizeTwitter(raw) {
+  if (!raw) return null;
+
+  // Kalau raw berupa array, ambil item pertama yang punya media video/gambar.
+  const item = Array.isArray(raw)
+    ? raw.find((i) => pickFirst(i, ['url', 'video', 'download_url', 'play', 'media', 'variants']))
+    : raw;
+  if (!item) return null;
+
+  // Kemungkinan 1: field video/url langsung berupa string atau array string.
+  let downloadUrl = pickFirst(item, ['url', 'video', 'download_url', 'play', 'hd', 'sd']);
+  if (Array.isArray(downloadUrl)) downloadUrl = downloadUrl[0];
+
+  // Kemungkinan 2: ada array "variants" / "media" berisi { url, bitrate/quality }.
+  if (!downloadUrl) {
+    const variants = pickFirst(item, ['variants', 'media', 'medias']);
+    if (Array.isArray(variants) && variants.length) {
+      // pilih bitrate/quality tertinggi kalau ada infonya, kalau tidak ambil yang pertama
+      const sorted = [...variants].sort(
+        (a, b) => (b.bitrate || b.quality || 0) - (a.bitrate || a.quality || 0)
+      );
+      downloadUrl = pickFirst(sorted[0] || {}, ['url', 'video', 'download_url']);
+    }
+  }
+
+  const thumbnail = pickFirst(item, ['thumbnail', 'cover', 'image', 'preview']);
+  const title = pickFirst(item, ['title', 'text', 'caption', 'desc']);
+  const author = pickFirst(item, ['author', 'username', 'user']);
+
+  if (!downloadUrl) return null;
+
+  return {
+    title: title || 'Video X (Twitter)',
+    author: author || '',
+    thumbnail: Array.isArray(thumbnail) ? thumbnail[0] : thumbnail || '',
+    downloadUrl,
+    audioUrl: null,
+  };
+}
+
 // ---------- Endpoint utama ----------
 app.post('/api/download', downloadLimiter, async (c) => {
   let body;
@@ -222,15 +291,14 @@ app.post('/api/download', downloadLimiter, async (c) => {
   if (!url || !platform) {
     return c.json({ success: false, message: 'url dan platform wajib diisi.' }, 400);
   }
-  if (platform !== 'tiktok' && platform !== 'instagram') {
-    return c.json({ success: false, message: 'platform harus "tiktok" atau "instagram".' }, 400);
+  if (!['tiktok', 'instagram', 'x'].includes(platform)) {
+    return c.json({ success: false, message: 'platform harus "tiktok", "instagram", atau "x".' }, 400);
   }
   if (!isValidPlatformUrl(url, platform)) {
+    const platformLabel =
+      platform === 'tiktok' ? 'TikTok' : platform === 'instagram' ? 'Instagram' : 'X (Twitter)';
     return c.json(
-      {
-        success: false,
-        message: `Link ini bukan link ${platform === 'tiktok' ? 'TikTok' : 'Instagram'} yang valid.`,
-      },
+      { success: false, message: `Link ini bukan link ${platformLabel} yang valid.` },
       400
     );
   }
@@ -243,9 +311,12 @@ app.post('/api/download', downloadLimiter, async (c) => {
     if (platform === 'tiktok') {
       const raw = await ttdl(url);
       normalized = normalizeTikTok(raw, wantAudioOnly);
-    } else {
+    } else if (platform === 'instagram') {
       const raw = await igdl(url);
       normalized = normalizeInstagram(raw);
+    } else {
+      const raw = await xdl(url);
+      normalized = normalizeTwitter(raw);
     }
 
     if (!normalized || (!normalized.downloadUrl && !normalized.audioUrl)) {
@@ -277,16 +348,29 @@ app.post('/api/download', downloadLimiter, async (c) => {
   }
 });
 
-// ---------- Whitelist host video sumber (proteksi biar Worker ini gak jadi open proxy) ----------
+// ---------- Whitelist host video & thumbnail sumber ----------
+// (biar Worker ini gak jadi open proxy, tapi cukup lebar buat nutup
+// semua variasi subdomain CDN yang biasa dipakai buat THUMBNAIL,
+// bukan cuma video-nya saja.)
 const ALLOWED_MEDIA_HOSTS = [
-  // TikTok
+  // TikTok - video CDN
   /(^|\.)tiktokcdn\.com$/,
   /(^|\.)tiktokcdn-us\.com$/,
+  /(^|\.)tiktokcdn-eu\.com$/,
   /(^|\.)tiktokv\.com$/,
+  /(^|\.)tiktokv-eu\.com$/,
   /(^|\.)dl\.tiktokio\.com$/,
-  // Instagram
+  // TikTok - thumbnail/cover CDN (sering beda subdomain dari video)
+  /(^|\.)ibyteimg\.com$/,
+  /(^|\.)ibytedtos\.com$/,
+  /(^|\.)muscdn\.com$/,
+  /(^|\.)byteimg\.com$/,
+  // Instagram / Facebook CDN (thumbnail & video sama-sama di sini)
   /(^|\.)cdninstagram\.com$/,
   /(^|\.)fbcdn\.net$/,
+  // X / Twitter
+  /(^|\.)twimg\.com$/,
+  /(^|\.)video\.twimg\.com$/,
   // backend pihak ketiga yang dipakai
   /(^|\.)tioo\.eu\.org$/,
 ];
@@ -301,28 +385,19 @@ function isAllowedMediaUrl(rawUrl) {
   }
 }
 
-// ---------- Endpoint proxy media (versi diperbaiki) ----------
-// Masalah sebelumnya: link sumber (mis. dl.tiktokio.com) pakai token
-// sekali-pakai. Tag <video> di browser kirim beberapa request Range
-// terpisah, dan tiap request itu men-trigger fetch BARU ke sumber ->
-// request kedua dst gagal (404) karena token sudah "dipakai".
-//
-// Perbaikan: fetch ke sumber HANYA SEKALI, simpan hasilnya di Cloudflare
-// Cache API (per targetUrl, bukan per Range), lalu semua request Range
-// dari browser dilayani dari cache tsb, bukan fetch ulang ke sumber.
-app.get('/api/proxy', async (c) => {
+// ---------- Handler proxy media (dipakai untuk GET & HEAD) ----------
+async function handleProxy(c) {
   const targetUrl = c.req.query('url');
 
   if (!targetUrl) {
     return c.json({ success: false, message: 'Parameter url wajib diisi.' }, 400);
   }
   if (!isAllowedMediaUrl(targetUrl)) {
+    console.warn('[/api/proxy] host ditolak whitelist:', targetUrl);
     return c.json({ success: false, message: 'Sumber media tidak diizinkan.' }, 403);
   }
 
   const cache = caches.default;
-  // Cache key sengaja diambil dari targetUrl saja (tanpa Range),
-  // supaya semua request Range untuk video yang sama dianggap 1 entri cache.
   const cacheKey = new Request(
     `https://cache-key.internal/proxy?u=${encodeURIComponent(targetUrl)}`
   );
@@ -334,14 +409,14 @@ app.get('/api/proxy', async (c) => {
     try {
       upstream = await fetch(targetUrl, {
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ttsaveig-backend)' },
-        // sengaja TIDAK mengirim Range di sini -> selalu minta file utuh
       });
     } catch (err) {
-      console.error('[/api/proxy] fetch error:', err);
+      console.error('[/api/proxy] fetch error:', targetUrl, err);
       return c.json({ success: false, message: 'Gagal mengambil media dari sumber.' }, 502);
     }
 
     if (!upstream.ok) {
+      console.error('[/api/proxy] upstream non-OK:', upstream.status, targetUrl);
       return c.json(
         { success: false, message: `Sumber media merespons status ${upstream.status}.` },
         502
@@ -349,7 +424,7 @@ app.get('/api/proxy', async (c) => {
     }
 
     const buffer = await upstream.arrayBuffer();
-    const contentType = upstream.headers.get('content-type') || 'video/mp4';
+    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
 
     fullResponse = new Response(buffer, {
       status: 200,
@@ -357,7 +432,6 @@ app.get('/api/proxy', async (c) => {
         'content-type': contentType,
         'content-length': String(buffer.byteLength),
         'accept-ranges': 'bytes',
-        // cache di edge selama 2 menit, cukup untuk satu sesi nonton preview
         'cache-control': 'public, max-age=120',
       },
     });
@@ -367,15 +441,26 @@ app.get('/api/proxy', async (c) => {
 
   const totalBuffer = await fullResponse.clone().arrayBuffer();
   const total = totalBuffer.byteLength;
-  const contentType = fullResponse.headers.get('content-type') || 'video/mp4';
+  const contentType = fullResponse.headers.get('content-type') || 'application/octet-stream';
+  const isImage = contentType.startsWith('image/');
   const rangeHeader = c.req.header('range');
 
   const baseHeaders = {
     'content-type': contentType,
     'accept-ranges': 'bytes',
     'access-control-allow-origin': '*',
-    'content-disposition': 'inline; filename="reelgrab-video.mp4"',
+    'content-disposition': isImage
+      ? 'inline; filename="reelgrab-thumbnail"'
+      : 'inline; filename="reelgrab-video.mp4"',
   };
+
+  // Untuk request HEAD, cukup kembalikan header saja tanpa body.
+  if (c.req.method === 'HEAD') {
+    return new Response(null, {
+      status: 200,
+      headers: { ...baseHeaders, 'content-length': String(total) },
+    });
+  }
 
   if (rangeHeader) {
     const match = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
@@ -403,9 +488,35 @@ app.get('/api/proxy', async (c) => {
       'content-length': String(total),
     },
   });
+}
+
+// Didaftarkan untuk GET dan HEAD, dan juga tanpa/dengan trailing slash,
+// supaya request thumbnail dari <img> (yang kadang browser kirim
+// sebagai HEAD dulu) tidak jatuh ke notFound -> 404.
+app.get('/api/proxy', handleProxy);
+app.get('/api/proxy/', handleProxy);
+app.on('HEAD', ['/api/proxy', '/api/proxy/'], handleProxy);
+
+// ---------- Error handler global ----------
+// Supaya exception yang tidak sengaja lolos dari try/catch manapun
+// tidak pernah muncul sebagai halaman error polos Cloudflare atau
+// status yang membingungkan (mis. 404 padahal sebenarnya route match
+// tapi ada bug di tengah proses) — semua tetap balik JSON konsisten.
+app.onError((err, c) => {
+  console.error('[unhandled error]', c.req.method, c.req.path, err);
+  return c.json(
+    { success: false, message: 'Terjadi kesalahan tak terduga di server.' },
+    500
+  );
 });
 
 // ---------- 404 handler ----------
-app.notFound((c) => c.json({ success: false, message: 'Endpoint tidak ditemukan.' }, 404));
+// Log method + path persis, supaya kalau masih ada 404 yang aneh
+// (mis. thumbnail keblokir lagi), tinggal cek `wrangler tail` dan
+// lihat baris ini untuk tahu path apa yang sebenarnya diminta.
+app.notFound((c) => {
+  console.warn('[404 not found]', c.req.method, c.req.path, c.req.url);
+  return c.json({ success: false, message: 'Endpoint tidak ditemukan.' }, 404);
+});
 
 export default app;
