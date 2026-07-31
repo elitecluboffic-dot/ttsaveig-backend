@@ -39,31 +39,35 @@ import { cors } from 'hono/cors';
       Cloudflare Cache API per targetUrl, lalu semua request Range
       dari browser dilayani dari cache tsb.
 
-   5) Ditambahkan dukungan platform "x" (Twitter/X). Endpoint backend
-      yang dipanggil ('twitter') mengikuti nama fungsi resmi di
-      library btch-downloader, TAPI bentuk response mentahnya belum
-      terverifikasi langsung (beda dengan ttdl/igdl yang sudah
-      terkonfirmasi dari kode lama). normalizeTwitter() dibuat
-      fleksibel (coba beberapa kemungkinan nama field) supaya lebih
-      tahan banting -> tetap perlu ditest ulang dengan link asli.
+   5) FIX THUMBNAIL/GAMBAR KE-404 DI /api/proxy:
+      - Root cause: /api/proxy tidak menerima method HEAD, dan tidak
+        ada error handler global -> exception yang lolos try/catch
+        bisa muncul sebagai 404/500 polos tanpa pesan jelas.
+      - Solusi: /api/proxy sekarang menerima GET *dan* HEAD, ditambah
+        app.onError() global, dan whitelist CDN diperluas untuk
+        menutup lebih banyak variasi subdomain thumbnail.
 
-   6) FIX THUMBNAIL/GAMBAR KE-404 DI /api/proxy:
-      - Root cause paling umum: request thumbnail/gambar dari <img>
-        kadang dikirim browser sebagai method selain GET (preflight,
-        prefetch, dsb), atau path-nya sedikit berbeda dari yang
-        didaftarkan router (trailing slash, dsb) -> jatuh ke
-        app.notFound() -> makanya browser lihat status 404.
-      - Solusi: /api/proxy sekarang menerima GET *dan* HEAD secara
-        eksplisit, ditambah app.onError() global supaya exception
-        yang tidak tertangkap tidak pernah "hilang" jadi 404/500
-        polos tanpa pesan yang jelas.
-      - Whitelist host CDN diperluas untuk menutup lebih banyak
-        variasi subdomain thumbnail TikTok/Instagram/X (p16-sign,
-        p19-sign, ibyteimg, muscdn, scontent-*, dst), karena
-        thumbnail sering datang dari CDN yang beda dengan video-nya.
-      - Ditambahkan log diagnostik di notFound handler supaya kalau
-        masih ada 404, kita bisa lihat persis method + path yang
-        gagal lewat `wrangler tail`.
+   6) X/TWITTER — IMPLEMENTASI PENUH (update ini):
+      - xdl() sekarang mencoba BEBERAPA nama endpoint di backend
+        pihak ketiga secara berurutan ('twitter', 'twitterdl', 'x'),
+        karena nama fungsi resmi btch-downloader untuk X kadang beda
+        antara versi lib dan versi backend HTTP-nya. Berhenti di
+        percobaan pertama yang sukses (HTTP 200 & bukan JSON kosong).
+      - normalizeTwitter() dirombak jadi jauh lebih tahan banting:
+        mendukung bentuk respons sebagai object langsung, array of
+        items, atau object berisi daftar "media"/"variants"/"videos"
+        dengan banyak kualitas berbeda (dipilih bitrate/quality
+        tertinggi otomatis). Juga mendukung struktur bersarang umum
+        di scraper Twitter seperti { url: { hd, sd } } atau
+        { thumbnail: { url } }.
+      - Kalau SEMUA percobaan endpoint gagal atau hasil parsing tetap
+        kosong, pesan error ke user dibuat lebih spesifik (beda dari
+        pesan generik "video tidak ditemukan") supaya jelas bahwa X
+        kemungkinan sedang tidak didukung backend pihak ketiga,
+        bukan link-nya yang salah.
+      - Ditambahkan log raw response (dipotong biar gak kepanjangan)
+        di console.error saat parsing gagal, supaya gampang di-debug
+        lewat `wrangler tail` kalau ada laporan link X yang gagal.
 ========================================================= */
 
 const app = new Hono();
@@ -140,7 +144,7 @@ async function btchGet(endpoint, url) {
     headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ttsaveig-backend)' },
   });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}: request ke backend gagal`);
+    throw new Error(`HTTP ${res.status}: request ke backend gagal (endpoint: ${endpoint})`);
   }
   try {
     return await res.json();
@@ -159,9 +163,37 @@ async function igdl(url) {
   return btchGet('igdl', url);
 }
 
-// Bentuk respons mentah X/Twitter: BELUM terverifikasi 100%, lihat catatan (5) di atas.
+// X/Twitter: nama endpoint resmi di backend pihak ketiga belum
+// terverifikasi 100% dan bisa beda antar versi -> coba beberapa
+// kandidat nama secara berurutan, pakai yang pertama berhasil.
+const TWITTER_ENDPOINT_CANDIDATES = ['twitter', 'twitterdl', 'x', 'xdl'];
+
+function isEmptyResult(raw) {
+  if (raw == null) return true;
+  if (Array.isArray(raw)) return raw.length === 0;
+  if (typeof raw === 'object') return Object.keys(raw).length === 0;
+  if (typeof raw === 'string') return raw.trim().length === 0;
+  return false;
+}
+
 async function xdl(url) {
-  return btchGet('twitter', url);
+  const errors = [];
+
+  for (const endpoint of TWITTER_ENDPOINT_CANDIDATES) {
+    try {
+      const raw = await btchGet(endpoint, url);
+      if (!isEmptyResult(raw)) {
+        return raw;
+      }
+      errors.push(`${endpoint}: respons kosong`);
+    } catch (err) {
+      errors.push(`${endpoint}: ${err.message}`);
+    }
+  }
+
+  // Semua kandidat endpoint gagal -> lempar error gabungan supaya
+  // ketahuan di log endpoint mana saja yang sudah dicoba.
+  throw new Error(`Semua endpoint X/Twitter gagal -> ${errors.join(' | ')}`);
 }
 
 // ---------- Helper functions ----------
@@ -190,7 +222,33 @@ function isValidPlatformUrl(url, platform) {
 
 function pickFirst(obj, keys) {
   for (const key of keys) {
-    if (obj && obj[key]) return obj[key];
+    if (obj && obj[key] !== undefined && obj[key] !== null && obj[key] !== '') {
+      return obj[key];
+    }
+  }
+  return null;
+}
+
+// Ambil string URL dari sebuah nilai yang bisa berupa: string biasa,
+// array of string, atau object bersarang seperti { hd, sd } / { url }.
+function unwrapUrlValue(value) {
+  if (!value) return null;
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    for (const v of value) {
+      const found = unwrapUrlValue(v);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof value === 'object') {
+    return (
+      unwrapUrlValue(value.hd) ||
+      unwrapUrlValue(value.sd) ||
+      unwrapUrlValue(value.url) ||
+      unwrapUrlValue(value.link) ||
+      null
+    );
   }
   return null;
 }
@@ -234,44 +292,95 @@ function normalizeInstagram(raw) {
   };
 }
 
-// Parser fleksibel untuk X/Twitter -- lihat catatan (5) di atas.
-// Mencoba banyak kemungkinan bentuk: object langsung, array item,
-// atau object dengan daftar "variants"/"media" berkualitas berbeda.
+// Skor kualitas kandidat varian video X/Twitter, dipakai untuk
+// milih varian bitrate/resolusi tertinggi kalau ada beberapa.
+function variantQualityScore(variant) {
+  if (!variant || typeof variant !== 'object') return 0;
+  const bitrate = Number(variant.bitrate) || 0;
+  const quality = Number(variant.quality) || 0;
+  const height = Number(variant.height) || 0;
+  const width = Number(variant.width) || 0;
+  // Bitrate biasanya paling representatif buat video Twitter (dalam bps),
+  // fallback ke quality/resolusi kalau bitrate tidak ada.
+  return bitrate || quality * 1000 || height * width || 0;
+}
+
+// Cari daftar varian video di berbagai kemungkinan struktur response.
+function extractTwitterVariants(item) {
+  const candidates = pickFirst(item, [
+    'variants',
+    'media',
+    'medias',
+    'videos',
+    'video_versions',
+    'formats',
+  ]);
+  if (Array.isArray(candidates) && candidates.length) return candidates;
+
+  // Kadang video ada di dalam item.video.variants atau item.media.videos
+  const nestedVideo = item && (item.video || item.media);
+  if (nestedVideo && typeof nestedVideo === 'object') {
+    const nested = pickFirst(nestedVideo, ['variants', 'videos', 'formats']);
+    if (Array.isArray(nested) && nested.length) return nested;
+  }
+
+  return [];
+}
+
+// Parser fleksibel untuk X/Twitter — dirancang untuk menangani banyak
+// kemungkinan bentuk respons dari backend pihak ketiga, karena bentuk
+// pastinya belum terdokumentasi resmi. Lihat catatan (6) di header.
 function normalizeTwitter(raw) {
   if (!raw) return null;
 
-  // Kalau raw berupa array, ambil item pertama yang punya media video/gambar.
+  // Kalau raw berupa array, ambil item pertama yang kelihatan valid.
   const item = Array.isArray(raw)
-    ? raw.find((i) => pickFirst(i, ['url', 'video', 'download_url', 'play', 'media', 'variants']))
+    ? raw.find((i) =>
+        pickFirst(i, ['url', 'video', 'download_url', 'play', 'media', 'variants', 'videos'])
+      )
     : raw;
   if (!item) return null;
 
-  // Kemungkinan 1: field video/url langsung berupa string atau array string.
-  let downloadUrl = pickFirst(item, ['url', 'video', 'download_url', 'play', 'hd', 'sd']);
-  if (Array.isArray(downloadUrl)) downloadUrl = downloadUrl[0];
+  // Kemungkinan 1: field video/url langsung berupa string, array, atau
+  // object bersarang seperti { hd, sd }.
+  let downloadUrl = unwrapUrlValue(
+    pickFirst(item, ['url', 'video', 'download_url', 'play', 'hd', 'sd'])
+  );
 
-  // Kemungkinan 2: ada array "variants" / "media" berisi { url, bitrate/quality }.
+  // Kemungkinan 2: ada daftar varian kualitas berbeda -> pilih terbaik.
   if (!downloadUrl) {
-    const variants = pickFirst(item, ['variants', 'media', 'medias']);
-    if (Array.isArray(variants) && variants.length) {
-      // pilih bitrate/quality tertinggi kalau ada infonya, kalau tidak ambil yang pertama
-      const sorted = [...variants].sort(
-        (a, b) => (b.bitrate || b.quality || 0) - (a.bitrate || a.quality || 0)
+    const variants = extractTwitterVariants(item);
+    if (variants.length) {
+      // Cuma pertimbangkan varian yang benar-benar video (content_type
+      // mp4 kalau infonya ada), abaikan varian m3u8/playlist kalau
+      // ada alternatif mp4 langsung.
+      const mp4Variants = variants.filter((v) => {
+        const type = (v && (v.content_type || v.type || v.mimeType)) || '';
+        return !type || /mp4/i.test(type);
+      });
+      const pool = mp4Variants.length ? mp4Variants : variants;
+
+      const sorted = [...pool].sort(
+        (a, b) => variantQualityScore(b) - variantQualityScore(a)
       );
-      downloadUrl = pickFirst(sorted[0] || {}, ['url', 'video', 'download_url']);
+      downloadUrl = unwrapUrlValue(
+        pickFirst(sorted[0] || {}, ['url', 'video', 'download_url', 'src'])
+      );
     }
   }
 
-  const thumbnail = pickFirst(item, ['thumbnail', 'cover', 'image', 'preview']);
-  const title = pickFirst(item, ['title', 'text', 'caption', 'desc']);
-  const author = pickFirst(item, ['author', 'username', 'user']);
-
   if (!downloadUrl) return null;
+
+  const thumbnail = unwrapUrlValue(
+    pickFirst(item, ['thumbnail', 'cover', 'image', 'preview', 'poster'])
+  );
+  const title = pickFirst(item, ['title', 'text', 'caption', 'desc']);
+  const author = pickFirst(item, ['author', 'username', 'user', 'nickname']);
 
   return {
     title: title || 'Video X (Twitter)',
     author: author || '',
-    thumbnail: Array.isArray(thumbnail) ? thumbnail[0] : thumbnail || '',
+    thumbnail: thumbnail || '',
     downloadUrl,
     audioUrl: null,
   };
@@ -317,16 +426,21 @@ app.post('/api/download', downloadLimiter, async (c) => {
     } else {
       const raw = await xdl(url);
       normalized = normalizeTwitter(raw);
+
+      if (!normalized) {
+        // Log raw response (dipotong) supaya gampang di-debug lewat
+        // `wrangler tail` kalau ada laporan link X yang gagal parse.
+        const rawPreview = JSON.stringify(raw).slice(0, 500);
+        console.error('[/api/download] gagal parse respons X/Twitter:', rawPreview);
+      }
     }
 
     if (!normalized || (!normalized.downloadUrl && !normalized.audioUrl)) {
-      return c.json(
-        {
-          success: false,
-          message: 'Video tidak ditemukan. Pastikan link publik (bukan akun privat) dan masih tersedia.',
-        },
-        404
-      );
+      const message =
+        platform === 'x'
+          ? 'Video X (Twitter) tidak ditemukan atau formatnya belum didukung. Pastikan link publik dan berupa video (bukan post foto/teks saja).'
+          : 'Video tidak ditemukan. Pastikan link publik (bukan akun privat) dan masih tersedia.';
+      return c.json({ success: false, message }, 404);
     }
 
     return c.json({
@@ -337,7 +451,7 @@ app.post('/api/download', downloadLimiter, async (c) => {
       },
     });
   } catch (err) {
-    console.error('[/api/download] error:', err);
+    console.error(`[/api/download] error (platform=${platform}):`, err);
     return c.json(
       {
         success: false,
@@ -368,9 +482,8 @@ const ALLOWED_MEDIA_HOSTS = [
   // Instagram / Facebook CDN (thumbnail & video sama-sama di sini)
   /(^|\.)cdninstagram\.com$/,
   /(^|\.)fbcdn\.net$/,
-  // X / Twitter
+  // X / Twitter - video & thumbnail sama-sama di *.twimg.com
   /(^|\.)twimg\.com$/,
-  /(^|\.)video\.twimg\.com$/,
   // backend pihak ketiga yang dipakai
   /(^|\.)tioo\.eu\.org$/,
 ];
