@@ -25,29 +25,19 @@ import { cors } from 'hono/cors';
       sekali. Jadi endpoint itu kita panggil langsung di bawah ini,
       tanpa dependency pihak ketiga yang bermasalah.
 
-   3) Ditambahkan endpoint /api/proxy supaya URL video asli dari
-      server sumber (mis. dl.tiktokio.com) tidak terlihat langsung
-      oleh browser user. Semua byte video sekarang melewati Worker
-      ini dulu sebelum sampai ke browser.
+   3) [DICABUT — lihat poin 9] Sempat ditambahkan endpoint /api/proxy
+      supaya URL video asli dari server sumber (mis. dl.tiktokio.com)
+      tidak terlihat langsung oleh browser user.
 
-   4) /api/proxy diperbaiki: link sumber (mis. dl.tiktokio.com) pakai
-      token sekali-pakai, sedangkan tag <video> di browser mengirim
-      beberapa request Range terpisah -> tiap request lama memicu
-      fetch BARU ke sumber -> request kedua dst gagal (404) karena
-      token sudah "dipakai". Sekarang: fetch ke sumber HANYA SEKALI
-      (tanpa meneruskan Range ke upstream), hasilnya disimpan di
-      Cloudflare Cache API per targetUrl, lalu semua request Range
-      dari browser dilayani dari cache tsb.
+   4) [DICABUT — lihat poin 9] /api/proxy sempat diperbaiki supaya fetch
+      ke sumber cuma sekali per targetUrl dan disimpan di Cache API,
+      karena token sekali-pakai bentrok dengan banyak request Range dari
+      tag <video>.
 
-   5) FIX THUMBNAIL/GAMBAR KE-404 DI /api/proxy:
-      - Root cause: /api/proxy tidak menerima method HEAD, dan tidak
-        ada error handler global -> exception yang lolos try/catch
-        bisa muncul sebagai 404/500 polos tanpa pesan jelas.
-      - Solusi: /api/proxy sekarang menerima GET *dan* HEAD, ditambah
-        app.onError() global, dan whitelist CDN diperluas untuk
-        menutup lebih banyak variasi subdomain thumbnail.
+   5) [DICABUT — lihat poin 9] Fix thumbnail/gambar 404 di /api/proxy
+      dengan menambahkan dukungan method HEAD dan error handler global.
 
-   6) PINTEREST — MENGGANTIKAN X/TWITTER (update ini):
+   6) PINTEREST — MENGGANTIKAN X/TWITTER:
       - Dukungan X/Twitter dicabut sepenuhnya dan digantikan dengan
         Pinterest, karena backend pihak ketiga jauh lebih stabil untuk
         Pinterest dan kebutuhan user lebih sering ke arah situ.
@@ -76,9 +66,11 @@ import { cors } from 'hono/cors';
         gagal.
       - Whitelist host media diperbarui: *.pinimg.com (CDN gambar &
         video Pinterest) ditambahkan, *.twimg.com dicabut karena sudah
-        tidak dipakai.
+        tidak dipakai. (Catatan: whitelist ini sendiri sudah tidak
+        relevan lagi setelah poin 9, karena Worker tidak lagi memproxy
+        media apa pun.)
 
-   7) FIX "Pin Pinterest tidak ditemukan" PADAHAL PIN-NYA ADA (update ini):
+   7) FIX "Pin Pinterest tidak ditemukan" PADAHAL PIN-NYA ADA:
       - Dikonfirmasi lewat dokumentasi resmi btch-downloader bahwa nama
         fungsi/endpoint untuk Pinterest memang persis 'pinterest' (sudah
         jadi kandidat pertama di PINTEREST_ENDPOINT_CANDIDATES, jadi
@@ -103,7 +95,7 @@ import { cors } from 'hono/cors';
         ASLI dari backend, dan itulah yang dibutuhkan untuk
         menyesuaikan normalizePinterest() secara presisi.
 
-   8) CLOUDFLARE TURNSTILE (CAPTCHA) SEBELUM /api/download (update ini):
+   8) CLOUDFLARE TURNSTILE (CAPTCHA) SEBELUM /api/download:
       - Ditambahkan verifikasi Cloudflare Turnstile supaya endpoint
         /api/download tidak bisa dipanggil otomatis oleh bot/script
         tanpa menyelesaikan captcha dulu di sisi frontend.
@@ -125,6 +117,33 @@ import { cors } from 'hono/cors';
         dikonfigurasi di server"), BUKAN diam-diam meloloskan request
         tanpa verifikasi -> ini sengaja supaya tidak ada mode "gagal
         terbuka" yang bikin proteksi captcha bocor tanpa disadari.
+
+   9) HAPUS TOTAL /api/proxy (update ini, atas permintaan langsung):
+      - Root cause error "Worker exceeded resource limits" (Cloudflare
+        error 1102) adalah handleProxy() yang menarik SELURUH isi video
+        ke memory Worker lewat `upstream.arrayBuffer()` sebelum
+        dikirim ke browser. Untuk video yang agak besar, ini gampang
+        melewati limit CPU time / memory instance Worker (apalagi di
+        plan gratis), jadi Worker mati di tengah proses -> Cloudflare
+        balikin halaman error 1102, atau kadang malah nyangkut jadi
+        exception yang ke-catch di app.onError() -> muncul sebagai
+        pesan generik "Terjadi kesalahan tak terduga di server."
+      - Karena /api/download SUDAH mengembalikan downloadUrl/audioUrl
+        ASLI dari sumber (dl.tiktokio.com dkk) di response JSON-nya,
+        proxy sebenarnya bukan satu-satunya jalan -> frontend bisa
+        langsung memakai URL itu untuk <video src>, <audio src>, atau
+        link <a download>, tanpa lewat Worker ini sama sekali.
+      - Konsekuensi yang perlu diketahui: URL asli sumber (berikut
+        token sekali-pakainya) sekarang terlihat oleh browser user,
+        dan playback/download sepenuhnya bergantung pada server sumber
+        (dl.tiktokio.com dkk) merespons request Range dengan benar.
+        Kalau nanti ternyata source itu suka nolak request langsung
+        dari browser (mis. karena cek header Origin/Referer), proxy
+        perlu dihidupkan lagi tapi dengan streaming (ReadableStream)
+        alih-alih buffer penuh ke memory, supaya tidak kena limit lagi.
+      - Semua kode terkait (handleProxy, isAllowedMediaUrl,
+        ALLOWED_MEDIA_HOSTS, route /api/proxy & /api/proxy/, handler
+        HEAD-nya) dihapus dari file ini.
 ========================================================= */
 
 const app = new Hono();
@@ -767,6 +786,11 @@ app.post('/api/download', downloadLimiter, async (c) => {
       return c.json({ success: false, message }, 404);
     }
 
+    // downloadUrl / audioUrl di sini adalah URL ASLI dari sumber
+    // (dl.tiktokio.com, cdninstagram.com, i.pinimg.com, dst.) -> tidak
+    // lagi dibungkus lewat /api/proxy (lihat catatan poin 9 di header).
+    // Frontend tinggal pakai langsung untuk <video src>, <audio src>,
+    // atau <a download href>.
     return c.json({
       success: true,
       data: {
@@ -786,155 +810,6 @@ app.post('/api/download', downloadLimiter, async (c) => {
   }
 });
 
-// ---------- Whitelist host video & thumbnail sumber ----------
-// (biar Worker ini gak jadi open proxy, tapi cukup lebar buat nutup
-// semua variasi subdomain CDN yang biasa dipakai buat THUMBNAIL,
-// bukan cuma video-nya saja.)
-const ALLOWED_MEDIA_HOSTS = [
-  // TikTok - video CDN
-  /(^|\.)tiktokcdn\.com$/,
-  /(^|\.)tiktokcdn-us\.com$/,
-  /(^|\.)tiktokcdn-eu\.com$/,
-  /(^|\.)tiktokv\.com$/,
-  /(^|\.)tiktokv-eu\.com$/,
-  /(^|\.)dl\.tiktokio\.com$/,
-  // TikTok - thumbnail/cover CDN (sering beda subdomain dari video)
-  /(^|\.)ibyteimg\.com$/,
-  /(^|\.)ibytedtos\.com$/,
-  /(^|\.)muscdn\.com$/,
-  /(^|\.)byteimg\.com$/,
-  // Instagram / Facebook CDN (thumbnail & video sama-sama di sini)
-  /(^|\.)cdninstagram\.com$/,
-  /(^|\.)fbcdn\.net$/,
-  // Pinterest - gambar & video sama-sama di *.pinimg.com (mis. i.pinimg.com,
-  // v1.pinimg.com, v.pinimg.com, s.pinimg.com)
-  /(^|\.)pinimg\.com$/,
-  // backend pihak ketiga yang dipakai
-  /(^|\.)tioo\.eu\.org$/,
-];
-
-function isAllowedMediaUrl(rawUrl) {
-  try {
-    const { hostname, protocol } = new URL(rawUrl);
-    if (protocol !== 'https:') return false;
-    return ALLOWED_MEDIA_HOSTS.some((re) => re.test(hostname));
-  } catch {
-    return false;
-  }
-}
-
-// ---------- Handler proxy media (dipakai untuk GET & HEAD) ----------
-async function handleProxy(c) {
-  const targetUrl = c.req.query('url');
-
-  if (!targetUrl) {
-    return c.json({ success: false, message: 'Parameter url wajib diisi.' }, 400);
-  }
-  if (!isAllowedMediaUrl(targetUrl)) {
-    console.warn('[/api/proxy] host ditolak whitelist:', targetUrl);
-    return c.json({ success: false, message: 'Sumber media tidak diizinkan.' }, 403);
-  }
-
-  const cache = caches.default;
-  const cacheKey = new Request(
-    `https://cache-key.internal/proxy?u=${encodeURIComponent(targetUrl)}`
-  );
-
-  let fullResponse = await cache.match(cacheKey);
-
-  if (!fullResponse) {
-    let upstream;
-    try {
-      upstream = await fetch(targetUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ttsaveig-backend)' },
-      });
-    } catch (err) {
-      console.error('[/api/proxy] fetch error:', targetUrl, err);
-      return c.json({ success: false, message: 'Gagal mengambil media dari sumber.' }, 502);
-    }
-
-    if (!upstream.ok) {
-      console.error('[/api/proxy] upstream non-OK:', upstream.status, targetUrl);
-      return c.json(
-        { success: false, message: `Sumber media merespons status ${upstream.status}.` },
-        502
-      );
-    }
-
-    const buffer = await upstream.arrayBuffer();
-    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
-
-    fullResponse = new Response(buffer, {
-      status: 200,
-      headers: {
-        'content-type': contentType,
-        'content-length': String(buffer.byteLength),
-        'accept-ranges': 'bytes',
-        'cache-control': 'public, max-age=120',
-      },
-    });
-
-    c.executionCtx.waitUntil(cache.put(cacheKey, fullResponse.clone()));
-  }
-
-  const totalBuffer = await fullResponse.clone().arrayBuffer();
-  const total = totalBuffer.byteLength;
-  const contentType = fullResponse.headers.get('content-type') || 'application/octet-stream';
-  const isImage = contentType.startsWith('image/');
-  const rangeHeader = c.req.header('range');
-
-  const baseHeaders = {
-    'content-type': contentType,
-    'accept-ranges': 'bytes',
-    'access-control-allow-origin': '*',
-    'content-disposition': isImage
-      ? 'inline; filename="reelgrab-thumbnail"'
-      : 'inline; filename="reelgrab-video.mp4"',
-  };
-
-  // Untuk request HEAD, cukup kembalikan header saja tanpa body.
-  if (c.req.method === 'HEAD') {
-    return new Response(null, {
-      status: 200,
-      headers: { ...baseHeaders, 'content-length': String(total) },
-    });
-  }
-
-  if (rangeHeader) {
-    const match = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
-    let start = match && match[1] ? parseInt(match[1], 10) : 0;
-    let end = match && match[2] ? parseInt(match[2], 10) : total - 1;
-    if (Number.isNaN(start) || start < 0) start = 0;
-    if (Number.isNaN(end) || end >= total) end = total - 1;
-
-    const chunk = totalBuffer.slice(start, end + 1);
-
-    return new Response(chunk, {
-      status: 206,
-      headers: {
-        ...baseHeaders,
-        'content-range': `bytes ${start}-${end}/${total}`,
-        'content-length': String(chunk.byteLength),
-      },
-    });
-  }
-
-  return new Response(totalBuffer, {
-    status: 200,
-    headers: {
-      ...baseHeaders,
-      'content-length': String(total),
-    },
-  });
-}
-
-// Didaftarkan untuk GET dan HEAD, dan juga tanpa/dengan trailing slash,
-// supaya request thumbnail dari <img> (yang kadang browser kirim
-// sebagai HEAD dulu) tidak jatuh ke notFound -> 404.
-app.get('/api/proxy', handleProxy);
-app.get('/api/proxy/', handleProxy);
-app.on('HEAD', ['/api/proxy', '/api/proxy/'], handleProxy);
-
 // ---------- Error handler global ----------
 // Supaya exception yang tidak sengaja lolos dari try/catch manapun
 // tidak pernah muncul sebagai halaman error polos Cloudflare atau
@@ -949,9 +824,10 @@ app.onError((err, c) => {
 });
 
 // ---------- 404 handler ----------
-// Log method + path persis, supaya kalau masih ada 404 yang aneh
-// (mis. thumbnail keblokir lagi), tinggal cek `wrangler tail` dan
-// lihat baris ini untuk tahu path apa yang sebenarnya diminta.
+// Log method + path persis, supaya kalau ada request ke path yang
+// sudah tidak ada lagi (mis. /api/proxy yang sudah dihapus), tinggal
+// cek `wrangler tail` dan lihat baris ini untuk tahu path apa yang
+// sebenarnya diminta.
 app.notFound((c) => {
   console.warn('[404 not found]', c.req.method, c.req.path, c.req.url);
   return c.json({ success: false, message: 'Endpoint tidak ditemukan.' }, 404);
