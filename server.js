@@ -234,6 +234,43 @@ import { cors } from 'hono/cors';
       - Elemen <video>/<img> untuk PREVIEW tetap pakai downloadUrl /
         audioUrl mentah seperti biasa (tidak butuh token, tidak lewat
         Worker ini), konsisten dengan catatan di poin 10.
+
+   13) INSTAGRAM: DETEKSI VIDEO VS GAMBAR (update ini):
+      - Sebelum ini, normalizeInstagram() TIDAK PERNAH mengisi field
+        `isVideo` sama sekali (beda dari normalizePinterest() yang
+        sudah punya deteksi ini sejak awal). Akibatnya `data.isVideo`
+        selalu `undefined` untuk Instagram, dan di frontend
+        `data.isVideo === false` selalu bernilai false -> postingan
+        Instagram yang sebenarnya berupa FOTO (bukan Reels/video)
+        tetap diperlakukan sebagai video:
+          * Mockup HP mencoba merender <video> dari file gambar (ada
+            fallback ke <img> di frontend kalau <video> gagal load,
+            jadi tidak crash, tapi sempat "flicker" gak perlu).
+          * File yang didownload lewat /api/download-file selalu diberi
+            nama berekstensi ".mp4" (lihat buildDownloadFileUrl di
+            bawah: `normalized.isVideo === false ? '.jpg' : '.mp4'`),
+            padahal isinya bisa jadi file gambar (.jpg/.png/.webp) ->
+            hasil unduhan foto Instagram jadi punya ekstensi yang salah.
+      - Solusi: normalizeInstagram() sekarang mendeteksi isVideo lewat
+        3 lapis, urut dari yang paling akurat ke paling umum:
+          1. Field eksplisit dari backend pihak ketiga kalau ada
+             (`type`/`media_type`/`is_video`/`isVideo`) -> beberapa
+             versi/fork btch-downloader menyertakan ini.
+          2. Kalau tidak ada field eksplisit, dicek dari EKSTENSI file
+             di URL downloadUrl-nya (.mp4/.mov/.webm/.m4v -> video;
+             .jpg/.jpeg/.png/.webp/.gif -> gambar).
+          3. Kalau ekstensi juga tidak kelihatan (URL CDN Instagram
+             sering berupa signed URL tanpa ekstensi jelas di path-nya),
+             DEFAULT ke video -> ini sengaja disamakan dengan perilaku
+             SEBELUM perbaikan ini, supaya kasus Reels/video (paling
+             umum dipakai) tidak berubah perilakunya sama sekali kalau
+             deteksi gagal, dan cuma memperbaiki kasus foto yang tadinya
+             pasti salah.
+      - Efeknya cuma di layer parsing/data (normalizeInstagram &
+        judul default "Gambar Instagram" vs "Video Instagram") -> tidak
+        menyentuh logic /api/download-file, buildDownloadFileUrl, atau
+        endpoint lain sama sekali, jadi tidak ada risiko bentrok dengan
+        alur TikTok/Pinterest yang sudah berjalan.
 ========================================================= */
 
 const app = new Hono();
@@ -556,22 +593,58 @@ function normalizeTikTok(raw, wantAudioOnly) {
   };
 }
 
+// Deteksi VIDEO vs GAMBAR untuk satu item Instagram. Dipakai oleh
+// normalizeInstagram() -> lihat catatan poin 13 di header file ini
+// untuk latar belakang lengkap kenapa ini dibutuhkan.
+//
+// Urutan pengecekan (dari paling akurat ke paling umum):
+//   1. Field eksplisit dari backend pihak ketiga kalau ada.
+//   2. Ekstensi file di URL downloadUrl-nya.
+//   3. Default ke video kalau dua cara di atas tidak kasih jawaban
+//      pasti (paling umum: link CDN Instagram tanpa ekstensi jelas).
+function detectInstagramIsVideo(item, downloadUrl) {
+  const explicitType = pickFirst(item, ['type', 'media_type', 'mediaType']);
+  const explicitIsVideo = pickFirst(item, ['is_video', 'isVideo']);
+
+  if (explicitIsVideo !== null) {
+    // Bisa berupa boolean asli (true/false) atau string ("true"/"false").
+    return explicitIsVideo === true || explicitIsVideo === 'true';
+  }
+
+  if (explicitType) {
+    return /video|reel/i.test(String(explicitType));
+  }
+
+  const url = downloadUrl || '';
+  if (/\.(mp4|mov|webm|m4v)(\?|$)/i.test(url)) return true;
+  if (/\.(jpg|jpeg|png|webp|gif)(\?|$)/i.test(url)) return false;
+
+  // Tidak ada petunjuk sama sekali -> default video, sama seperti
+  // perilaku sebelum perbaikan poin 13 (supaya kasus Reels/video yang
+  // paling umum tidak berubah kalau deteksi ini gagal menebak).
+  return true;
+}
+
 function normalizeInstagram(raw) {
   const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
   const item = list.find((i) => pickFirst(i, ['url', 'video', 'download_url', 'play']));
   if (!item) return null;
 
-  const downloadUrl = pickFirst(item, ['url', 'video', 'download_url', 'play']);
+  const downloadUrlRaw = pickFirst(item, ['url', 'video', 'download_url', 'play']);
+  const downloadUrl = Array.isArray(downloadUrlRaw) ? downloadUrlRaw[0] : downloadUrlRaw;
   const thumbnail = pickFirst(item, ['thumbnail', 'cover', 'image']);
   const title = pickFirst(item, ['title', 'caption', 'desc']);
   const author = pickFirst(item, ['author', 'username']);
 
+  const isVideo = detectInstagramIsVideo(item, downloadUrl);
+
   return {
-    title: title || 'Video/Foto Instagram',
+    title: title || (isVideo ? 'Video Instagram' : 'Gambar Instagram'),
     author: author || '',
     thumbnail: Array.isArray(thumbnail) ? thumbnail[0] : thumbnail || '',
-    downloadUrl: Array.isArray(downloadUrl) ? downloadUrl[0] : downloadUrl,
+    downloadUrl,
     audioUrl: null,
+    isVideo,
   };
 }
 
@@ -1151,6 +1224,12 @@ app.post('/api/download', downloadLimiter, async (c) => {
       return `${workerOrigin}/api/download-file?${params.toString()}`;
     }
 
+    // Ekstensi file unduhan sekarang konsisten untuk TikTok, Instagram,
+    // MAUPUN Pinterest: pakai .jpg kalau normalized.isVideo eksplisit
+    // false (gambar), selain itu .mp4 (video). Sebelum perbaikan poin
+    // 13, Instagram selalu jatuh ke .mp4 karena isVideo-nya undefined
+    // -> sekarang normalizeInstagram() sudah mengisi isVideo dengan
+    // benar, jadi baris ini otomatis ikut benar tanpa perlu diubah.
     const downloadFileUrl = await buildDownloadFileUrl(
       normalized.downloadUrl,
       normalized.isVideo === false ? '.jpg' : '.mp4'
