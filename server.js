@@ -293,6 +293,40 @@ function unwrapUrlValue(value) {
   return null;
 }
 
+// Ambil string TEKS biasa (mis. nama author/username) dari sebuah nilai
+// yang bisa berupa string langsung, array, atau object bersarang seperti
+// { username, full_name } / { name } — supaya tidak pernah kebocoran
+// jadi "[object Object]" di tampilan kalau backend mengembalikan object
+// alih-alih string polos.
+function unwrapTextValue(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+  }
+  if (typeof value === 'number') return String(value);
+  if (Array.isArray(value)) {
+    for (const v of value) {
+      const found = unwrapTextValue(v);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof value === 'object') {
+    return (
+      unwrapTextValue(value.username) ||
+      unwrapTextValue(value.full_name) ||
+      unwrapTextValue(value.fullName) ||
+      unwrapTextValue(value.name) ||
+      unwrapTextValue(value.nickname) ||
+      unwrapTextValue(value.display_name) ||
+      unwrapTextValue(value.displayName) ||
+      null
+    );
+  }
+  return null;
+}
+
 function normalizeTikTok(raw, wantAudioOnly) {
   if (!raw) return null;
 
@@ -539,16 +573,20 @@ function normalizePinterest(rawInput) {
     unwrapUrlValue(
       pickFirst(item, ['thumbnail', 'thumb', 'cover', 'preview', 'poster', 'image_url', 'imageUrl'])
     ) || (!isVideo ? downloadUrl : '');
-  const title = pickFirst(item, [
-    'title',
-    'grid_title',
-    'gridTitle',
-    'text',
-    'caption',
-    'desc',
-    'description',
-  ]);
-  const author = pickFirst(item, ['author', 'username', 'user', 'pinner', 'creator']);
+  const title = unwrapTextValue(
+    pickFirst(item, [
+      'title',
+      'grid_title',
+      'gridTitle',
+      'text',
+      'caption',
+      'desc',
+      'description',
+    ])
+  );
+  const author = unwrapTextValue(
+    pickFirst(item, ['author', 'username', 'user', 'pinner', 'creator'])
+  );
 
   return {
     title: title || (isVideo ? 'Video Pinterest' : 'Gambar Pinterest'),
