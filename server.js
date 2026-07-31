@@ -25,6 +25,11 @@ import { cors } from 'hono/cors';
       sekali. Jadi endpoint itu kita panggil langsung di bawah ini,
       tanpa dependency pihak ketiga yang bermasalah.
 
+   3) Ditambahkan endpoint /api/proxy supaya URL video asli dari
+      server sumber (mis. dl.tiktokio.com) tidak terlihat langsung
+      oleh browser user. Semua byte video sekarang melewati Worker
+      ini dulu sebelum sampai ke browser.
+
    Catatan: backend1.tioo.eu.org adalah layanan pihak ketiga yang tidak
    dioperasikan oleh kita. Kalau suatu saat mereka mengubah format
    respons atau endpoint-nya, fungsi ttdl()/igdl() di bawah ini perlu
@@ -261,6 +266,89 @@ app.post('/api/download', downloadLimiter, async (c) => {
       500
     );
   }
+});
+
+// ---------- Whitelist host video sumber (proteksi biar Worker ini gak jadi open proxy) ----------
+const ALLOWED_MEDIA_HOSTS = [
+  // TikTok
+  /(^|\.)tiktokcdn\.com$/,
+  /(^|\.)tiktokcdn-us\.com$/,
+  /(^|\.)tiktokv\.com$/,
+  /(^|\.)dl\.tiktokio\.com$/,
+  // Instagram
+  /(^|\.)cdninstagram\.com$/,
+  /(^|\.)fbcdn\.net$/,
+  // backend pihak ketiga yang dipakai
+  /(^|\.)tioo\.eu\.org$/,
+];
+
+function isAllowedMediaUrl(rawUrl) {
+  try {
+    const { hostname, protocol } = new URL(rawUrl);
+    if (protocol !== 'https:') return false;
+    return ALLOWED_MEDIA_HOSTS.some((re) => re.test(hostname));
+  } catch {
+    return false;
+  }
+}
+
+// ---------- Endpoint proxy media ----------
+// Browser akses videonya lewat sini, bukan langsung ke server sumber.
+// Support Range header supaya video tetap bisa di-seek/scrub normal.
+app.get('/api/proxy', async (c) => {
+  const targetUrl = c.req.query('url');
+
+  if (!targetUrl) {
+    return c.json({ success: false, message: 'Parameter url wajib diisi.' }, 400);
+  }
+  if (!isAllowedMediaUrl(targetUrl)) {
+    return c.json({ success: false, message: 'Sumber media tidak diizinkan.' }, 403);
+  }
+
+  const rangeHeader = c.req.header('range');
+
+  let upstream;
+  try {
+    upstream = await fetch(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; ttsaveig-backend)',
+        ...(rangeHeader ? { Range: rangeHeader } : {}),
+      },
+    });
+  } catch (err) {
+    console.error('[/api/proxy] fetch error:', err);
+    return c.json({ success: false, message: 'Gagal mengambil media dari sumber.' }, 502);
+  }
+
+  if (!upstream.ok && upstream.status !== 206) {
+    return c.json(
+      { success: false, message: `Sumber media merespons status ${upstream.status}.` },
+      502
+    );
+  }
+
+  // Teruskan header penting apa adanya (content-type, content-length, accept-ranges, dll)
+  const headers = new Headers();
+  const passthroughHeaders = [
+    'content-type',
+    'content-length',
+    'content-range',
+    'accept-ranges',
+    'cache-control',
+    'last-modified',
+    'etag',
+  ];
+  for (const key of passthroughHeaders) {
+    const value = upstream.headers.get(key);
+    if (value) headers.set(key, value);
+  }
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Content-Disposition', 'inline; filename="reelgrab-video.mp4"');
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers,
+  });
 });
 
 // ---------- 404 handler ----------
