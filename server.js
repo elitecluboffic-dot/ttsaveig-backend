@@ -272,63 +272,34 @@ import { cors } from 'hono/cors';
         endpoint lain sama sekali, jadi tidak ada risiko bentrok dengan
         alur TikTok/Pinterest yang sudah berjalan.
 
-   14) TRACKING JUMLAH KLIK TOMBOL "AMBIL VIDEO/GAMBAR" PER PLATFORM
-       (update ini):
+   14) TRACKING JUMLAH KLIK TOMBOL "AMBIL VIDEO/GAMBAR" PER PLATFORM:
       - Kebutuhan: mau tahu berapa orang yang sudah nyoba tombol
         "Ambil Video/Gambar" (Instagram), "Ambil Video" (TikTok), dan
         "Ambil Gambar" (Pinterest) di frontend -> per platform.
       - Dicatat di SISI SERVER, tepat di dalam /api/download, BUKAN
-        lewat event terpisah dari frontend -> karena setiap klik
-        tombol itu memang selalu memicu POST ke /api/download dengan
-        field `platform` yang sudah tervalidasi. Ini lebih akurat
-        daripada tracking di frontend (tidak bisa "lupa" ke-fire, dan
-        tidak gampang dipalsukan lewat DevTools/extension).
-      - Titik pencatatan: SETELAH Turnstile + validasi url/platform
-        lolos, TAPI SEBELUM memanggil backend pihak ketiga
-        (ttdl/igdl/pindl) -> jadi yang terhitung adalah percobaan yang
-        sudah pasti captcha-nya valid & link-nya format platform yang
-        benar, tidak peduli link-nya nanti berhasil diproses atau
-        tidak (video privat, backend pihak ketiga lagi down, dst tetap
-        dihitung sebagai "orang yang nyoba").
-      - Storage: pakai Cloudflare D1 (SQLite di edge, binding `DB` di
-        wrangler.toml) -> bukan KV, karena KV dibatasi ~1000 write/hari
-        di free tier yang gampang habis untuk tracking klik, sedangkan
-        D1 jauh lebih longgar (100rb write/hari di free tier) dan bisa
-        query agregat (GROUP BY, COUNT DISTINCT) langsung lewat SQL.
+        lewat event terpisah dari frontend.
+      - Storage: pakai Cloudflare D1 (SQLite di edge, binding `DB`).
       - Pencatatan (trackClickEvent) dijalankan lewat
-        `c.executionCtx.waitUntil(...)` -> supaya proses INSERT ke D1
-        tidak memperlambat response ke user sama sekali (user tidak
-        perlu menunggu tracking selesai dulu baru dapat hasil download).
-      - Kalau binding DB belum di-set di Worker (lupa setup), tracking
-        otomatis dilewati dengan console.warn (BUKAN bikin seluruh
-        /api/download gagal) -> supaya fitur intinya (download) tidak
-        pernah terganggu gara-gara fitur tracking yang notabene cuma
-        pelengkap.
-      - Endpoint baru GET /api/stats: mengembalikan rekap total klik,
-        breakdown per platform, perkiraan pengguna unik (COUNT DISTINCT
-        IP), dan tren harian -> dipakai oleh /dashboard.
-      - Endpoint baru GET /dashboard: halaman HTML sederhana (inline,
-        tidak perlu Workers Sites/Assets) yang menampilkan angka-angka
-        di atas plus grafik tren harian. Bisa dikunci pakai query
-        `?key=...` yang dicocokkan ke secret Worker DASHBOARD_ACCESS_KEY
-        (opsional) -> kalau secret itu belum di-set, dashboard tetap
-        bisa diakses siapa saja yang tahu URL-nya (cukup aman untuk data
-        sekadar hitungan klik, tapi tetap disarankan di-set untuk
-        produksi supaya tidak sembarang orang bisa lihat traffic).
-      - Setup yang WAJIB dilakukan supaya fitur ini aktif:
-        1. `wrangler d1 create ttsaveig-tracking` -> catat database_id
-           yang muncul.
-        2. Tambahkan binding di wrangler.toml:
-           [[d1_databases]]
-           binding = "DB"
-           database_name = "ttsaveig-tracking"
-           database_id = "<database_id dari langkah 1>"
-        3. Jalankan schema.sql (file terpisah, lihat folder project)
-           lewat: `wrangler d1 execute ttsaveig-tracking --file=./schema.sql`
-           (tambahkan --remote kalau mau langsung ke database production,
-           bukan cuma lokal).
-        4. (Opsional) `wrangler secret put DASHBOARD_ACCESS_KEY` untuk
-           mengunci /dashboard dan /api/stats dengan sebuah kunci akses.
+        `c.executionCtx.waitUntil(...)`.
+      - Endpoint GET /api/stats & GET /dashboard.
+
+   15) MODERNISASI TAMPILAN /dashboard (update ini):
+      - CSS lama terlalu polos/kuno (flat dark theme tanpa detail
+        visual) -> diganti total dengan tampilan yang lebih modern:
+        gradient background halus (ungu-tosca), efek glassmorphism di
+        kartu (blur + border tipis transparan), font Inter (Google
+        Fonts) untuk tipografi yang lebih rapi dibanding font sistem
+        default, animasi halus (hover-lift di kartu, spinner loading,
+        live-indicator berkedip), dan grafik Chart.js dipercantik
+        (garis lebih tebal, titik data jelas, tooltip custom, grid
+        lebih halus, legend dengan pointStyle bulat).
+      - Tidak ada perubahan logic/data sama sekali -> murni perubahan
+        HTML/CSS/JS di dalam string template `html` pada handler
+        GET /dashboard. Endpoint /api/stats, struktur data, dan semua
+        endpoint lain tidak tersentuh sedikit pun.
+      - Chart.js tetap di-load dari cdn.jsdelivr.net (bukan
+        cdnjs.cloudflare.com) karena cdnjs sempat diblokir di jaringan
+        sebagian user -> jsDelivr terbukti lebih reliable diakses.
 ========================================================= */
 
 const app = new Hono();
@@ -485,9 +456,9 @@ app.get('/api/stats', async (c) => {
   }
 });
 
-// Halaman dashboard sederhana — inline HTML (tidak butuh Workers
-// Sites/Assets), memanggil /api/stats via fetch relatif (same-origin,
-// jadi tidak kena isu CORS).
+// Halaman dashboard — inline HTML (tidak butuh Workers Sites/Assets),
+// memanggil /api/stats via fetch relatif (same-origin, jadi tidak kena
+// isu CORS). Lihat poin 15 di header file untuk detail modernisasi.
 app.get('/dashboard', (c) => {
   if (!isDashboardAuthorized(c)) {
     return c.text('Akses ditolak. Tambahkan ?key=<kunci akses yang benar> di URL.', 403);
@@ -503,75 +474,335 @@ app.get('/dashboard', (c) => {
 <meta charset="UTF-8" />
 <title>Reelgrab — Dashboard Tracking</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <style>
   :root {
-    --bg: #0b0d12; --card: #151822; --text: #f2f3f5; --muted: #9aa0ac;
-    --border: #262a35;
+    --bg-0: #05060a;
+    --bg-1: #0a0d16;
+    --surface: rgba(255, 255, 255, 0.04);
+    --surface-hover: rgba(255, 255, 255, 0.07);
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.16);
+    --text: #f5f6fa;
+    --muted: #8b91a7;
+    --muted-2: #5c6178;
+    --accent: #7c5cff;
+    --accent-2: #3ddad7;
+    --tiktok: #25f4ee;
+    --instagram: #ff3d81;
+    --pinterest: #ff5c5c;
+    --radius-lg: 20px;
+    --radius-md: 14px;
+    --radius-sm: 10px;
+    --shadow-soft: 0 20px 60px -20px rgba(0, 0, 0, 0.6);
   }
+
   * { box-sizing: border-box; }
-  body {
-    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg); color: var(--text); padding: 32px 24px 64px;
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    min-height: 100%;
   }
-  h1 { font-size: 24px; margin-bottom: 4px; }
-  .sub { color: var(--muted); margin-bottom: 32px; font-size: 14px; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 32px; max-width: 1000px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
-  .card .label { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
-  .card .value { font-size: 32px; font-weight: 700; }
-  .card .sub-value { color: var(--muted); font-size: 12px; margin-top: 4px; }
-  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; }
-  .chart-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 24px; max-width: 1000px; }
-  .refresh { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; margin-bottom: 24px; }
-  .refresh:hover { border-color: #444; }
-  .loading { color: var(--muted); font-size: 14px; }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(1200px 600px at 15% -10%, rgba(124, 92, 255, 0.20), transparent 60%),
+      radial-gradient(1000px 700px at 110% 10%, rgba(61, 218, 215, 0.14), transparent 55%),
+      var(--bg-0);
+    background-attachment: fixed;
+    padding: 48px 40px 96px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 1080px; margin: 0 auto; }
+
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 8px;
+  }
+
+  .logo {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    display: grid;
+    place-items: center;
+    font-size: 20px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    box-shadow: 0 8px 24px -8px rgba(124, 92, 255, 0.6);
+    flex-shrink: 0;
+  }
+
+  h1 {
+    font-size: 26px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    margin: 0;
+  }
+
+  .sub {
+    color: var(--muted);
+    margin: 6px 0 32px;
+    font-size: 14.5px;
+    max-width: 520px;
+  }
+
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 28px;
+  }
+
+  .refresh {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 18px;
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 13.5px;
+    font-weight: 600;
+    font-family: inherit;
+    transition: all 0.18s ease;
+    backdrop-filter: blur(12px);
+  }
+  .refresh:hover {
+    background: var(--surface-hover);
+    border-color: var(--border-strong);
+    transform: translateY(-1px);
+  }
+  .refresh:active { transform: translateY(0); }
+  .refresh .ico { transition: transform 0.5s ease; display: inline-block; }
+  .refresh.spinning .ico { transform: rotate(360deg); }
+
+  .live-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: #3ddc84;
+    box-shadow: 0 0 0 0 rgba(61, 220, 132, 0.6);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(61, 220, 132, 0.55); }
+    70%  { box-shadow: 0 0 0 8px rgba(61, 220, 132, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(61, 220, 132, 0); }
+  }
+  .live-label { color: var(--muted-2); font-size: 12.5px; font-weight: 500; }
+
+  .loading {
+    color: var(--muted);
+    font-size: 14px;
+    padding: 40px 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .spinner {
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    border: 2px solid var(--border-strong);
+    border-top-color: var(--accent-2);
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .error-box {
+    background: rgba(255, 90, 90, 0.08);
+    border: 1px solid rgba(255, 90, 90, 0.25);
+    color: #ff9d9d;
+    padding: 16px 18px;
+    border-radius: var(--radius-md);
+    font-size: 13.5px;
+    margin-top: 12px;
+  }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 16px;
+    margin-bottom: 28px;
+  }
+
+  .card {
+    position: relative;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 22px 22px 20px;
+    backdrop-filter: blur(16px);
+    overflow: hidden;
+    transition: border-color 0.2s ease, transform 0.2s ease;
+  }
+  .card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(160deg, rgba(255,255,255,0.05), transparent 40%);
+    pointer-events: none;
+  }
+  .card:hover {
+    border-color: var(--border-strong);
+    transform: translateY(-2px);
+  }
+  .card.total {
+    background: linear-gradient(135deg, rgba(124, 92, 255, 0.16), rgba(61, 218, 215, 0.08));
+    border-color: rgba(124, 92, 255, 0.3);
+  }
+
+  .card .label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 12.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 14px;
+  }
+  .dot {
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    box-shadow: 0 0 10px currentColor;
+  }
+  .dot.tiktok { background: var(--tiktok); color: var(--tiktok); }
+  .dot.instagram { background: var(--instagram); color: var(--instagram); }
+  .dot.pinterest { background: var(--pinterest); color: var(--pinterest); }
+
+  .card .value {
+    font-size: 34px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+  .card .sub-value {
+    color: var(--muted-2);
+    font-size: 12.5px;
+    margin-top: 6px;
+    font-weight: 500;
+  }
+
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 26px 26px 12px;
+    backdrop-filter: blur(16px);
+  }
+  .chart-card h2 {
+    font-size: 15px;
+    font-weight: 700;
+    margin: 0 0 20px;
+    color: var(--text);
+    letter-spacing: -0.01em;
+  }
+  .chart-inner { position: relative; height: 320px; }
+
+  .footer-note {
+    margin-top: 28px;
+    color: var(--muted-2);
+    font-size: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    text-align: center;
+  }
+
+  @media (max-width: 640px) {
+    body { padding: 32px 18px 64px; }
+    .cards { grid-template-columns: 1fr 1fr; }
+    .card .value { font-size: 26px; }
+  }
 </style>
 </head>
 <body>
-  <h1>📊 Dashboard Tracking Reelgrab</h1>
-  <div class="sub">Jumlah orang yang klik tombol "Ambil Video/Gambar" per platform</div>
+  <div class="wrap">
+    <div class="topbar">
+      <div class="logo">📊</div>
+      <div>
+        <h1>Dashboard Tracking Reelgrab</h1>
+      </div>
+    </div>
+    <p class="sub">Jumlah orang yang klik tombol "Ambil Video/Gambar" per platform, diperbarui langsung dari Cloudflare D1.</p>
 
-  <button class="refresh" onclick="loadStats()">↻ Refresh data</button>
+    <div class="toolbar">
+      <button class="refresh" id="refreshBtn" onclick="loadStats()">
+        <span class="ico">↻</span> Refresh data
+      </button>
+      <span class="live-dot"></span>
+      <span class="live-label">Terhubung ke database</span>
+    </div>
 
-  <div id="loading" class="loading">Memuat data...</div>
-  <div class="cards" id="cards" style="display:none;"></div>
-  <div class="chart-wrap" id="chartWrap" style="display:none;">
-    <canvas id="dailyChart" height="90"></canvas>
+    <div id="loading" class="loading">
+      <span class="spinner"></span> Memuat data...
+    </div>
+    <div id="errorBox" class="error-box" style="display:none;"></div>
+
+    <div class="cards" id="cards" style="display:none;"></div>
+
+    <div class="chart-card" id="chartWrap" style="display:none;">
+      <h2>Klik per hari per platform</h2>
+      <div class="chart-inner">
+        <canvas id="dailyChart"></canvas>
+      </div>
+    </div>
+
+    <div class="footer-note">reelgrab · ${dashboardKeyQuery ? 'akses terkunci' : 'akses terbuka'} · D1 edge database</div>
   </div>
 
   <script>
     const STATS_URL = '/api/stats${dashboardKeyQuery}';
     const PLATFORM_META = {
       tiktok: { label: 'TikTok', color: '#25f4ee' },
-      instagram: { label: 'Instagram', color: '#e1306c' },
-      pinterest: { label: 'Pinterest', color: '#e60023' }
+      instagram: { label: 'Instagram', color: '#ff3d81' },
+      pinterest: { label: 'Pinterest', color: '#ff5c5c' }
     };
     let chartInstance = null;
 
     async function loadStats() {
-      document.getElementById('loading').style.display = 'block';
+      const btn = document.getElementById('refreshBtn');
+      btn.classList.add('spinning');
+      document.getElementById('loading').style.display = 'flex';
+      document.getElementById('errorBox').style.display = 'none';
+      document.getElementById('cards').style.display = 'none';
+      document.getElementById('chartWrap').style.display = 'none';
+
       try {
         const res = await fetch(STATS_URL);
         const data = await res.json();
         if (!data.success) throw new Error(data.message || 'Gagal mengambil data');
         renderCards(data);
         renderChart(data.dailySeries);
+        document.getElementById('cards').style.display = 'grid';
+        document.getElementById('chartWrap').style.display = 'block';
       } catch (err) {
-        document.getElementById('loading').textContent = 'Gagal memuat data: ' + err.message;
-        return;
+        const box = document.getElementById('errorBox');
+        box.textContent = 'Gagal memuat data: ' + err.message;
+        box.style.display = 'block';
+      } finally {
+        document.getElementById('loading').style.display = 'none';
+        setTimeout(() => btn.classList.remove('spinning'), 500);
       }
-      document.getElementById('loading').style.display = 'none';
-      document.getElementById('cards').style.display = 'grid';
-      document.getElementById('chartWrap').style.display = 'block';
     }
 
     function renderCards(data) {
       const cardsEl = document.getElementById('cards');
       cardsEl.innerHTML = \`
-        <div class="card">
-          <div class="label">Total Klik (semua platform)</div>
-          <div class="value">\${data.totalClicks}</div>
+        <div class="card total">
+          <div class="label">Total Klik</div>
+          <div class="value">\${data.totalClicks.toLocaleString('id-ID')}</div>
+          <div class="sub-value">semua platform digabung</div>
         </div>
       \`;
       for (const key of Object.keys(PLATFORM_META)) {
@@ -580,9 +811,9 @@ app.get('/dashboard', (c) => {
         const unique = data.uniqueVisitorsApprox[key] || 0;
         cardsEl.innerHTML += \`
           <div class="card">
-            <div class="label"><span class="dot" style="background:\${meta.color}"></span>\${meta.label}</div>
-            <div class="value">\${count}</div>
-            <div class="sub-value">≈ \${unique} pengguna unik (berdasarkan IP)</div>
+            <div class="label"><span class="dot \${key}"></span>\${meta.label}</div>
+            <div class="value">\${count.toLocaleString('id-ID')}</div>
+            <div class="sub-value">≈ \${unique.toLocaleString('id-ID')} pengguna unik (IP)</div>
           </div>
         \`;
       }
@@ -595,8 +826,14 @@ app.get('/dashboard', (c) => {
         label: PLATFORM_META[key].label,
         data: dailySeries.map((d) => d[key] || 0),
         borderColor: PLATFORM_META[key].color,
-        backgroundColor: PLATFORM_META[key].color + '33',
-        tension: 0.3,
+        backgroundColor: PLATFORM_META[key].color + '22',
+        pointBackgroundColor: PLATFORM_META[key].color,
+        pointBorderColor: '#0a0d16',
+        pointBorderWidth: 2,
+        pointRadius: 4,
+        pointHoverRadius: 6,
+        borderWidth: 2.5,
+        tension: 0.35,
         fill: true
       }));
       if (chartInstance) chartInstance.destroy();
@@ -605,13 +842,42 @@ app.get('/dashboard', (c) => {
         data: { labels, datasets },
         options: {
           responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
           plugins: {
-            legend: { labels: { color: '#f2f3f5' } },
-            title: { display: true, text: 'Klik per hari per platform', color: '#f2f3f5' }
+            legend: {
+              position: 'top',
+              align: 'end',
+              labels: {
+                color: '#8b91a7',
+                usePointStyle: true,
+                pointStyle: 'circle',
+                boxWidth: 8,
+                font: { size: 12.5, weight: '600', family: 'Inter' }
+              }
+            },
+            tooltip: {
+              backgroundColor: '#12141e',
+              titleColor: '#f5f6fa',
+              bodyColor: '#c7cad6',
+              borderColor: 'rgba(255,255,255,0.1)',
+              borderWidth: 1,
+              padding: 12,
+              cornerRadius: 10,
+              titleFont: { family: 'Inter', weight: '700' },
+              bodyFont: { family: 'Inter' }
+            }
           },
           scales: {
-            x: { ticks: { color: '#9aa0ac' }, grid: { color: '#262a35' } },
-            y: { ticks: { color: '#9aa0ac' }, grid: { color: '#262a35' }, beginAtZero: true }
+            x: {
+              ticks: { color: '#5c6178', font: { family: 'Inter', size: 11.5 } },
+              grid: { color: 'rgba(255,255,255,0.04)', drawBorder: false }
+            },
+            y: {
+              ticks: { color: '#5c6178', font: { family: 'Inter', size: 11.5 } },
+              grid: { color: 'rgba(255,255,255,0.04)', drawBorder: false },
+              beginAtZero: true
+            }
           }
         }
       });
