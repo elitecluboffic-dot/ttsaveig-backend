@@ -271,6 +271,64 @@ import { cors } from 'hono/cors';
         menyentuh logic /api/download-file, buildDownloadFileUrl, atau
         endpoint lain sama sekali, jadi tidak ada risiko bentrok dengan
         alur TikTok/Pinterest yang sudah berjalan.
+
+   14) TRACKING JUMLAH KLIK TOMBOL "AMBIL VIDEO/GAMBAR" PER PLATFORM
+       (update ini):
+      - Kebutuhan: mau tahu berapa orang yang sudah nyoba tombol
+        "Ambil Video/Gambar" (Instagram), "Ambil Video" (TikTok), dan
+        "Ambil Gambar" (Pinterest) di frontend -> per platform.
+      - Dicatat di SISI SERVER, tepat di dalam /api/download, BUKAN
+        lewat event terpisah dari frontend -> karena setiap klik
+        tombol itu memang selalu memicu POST ke /api/download dengan
+        field `platform` yang sudah tervalidasi. Ini lebih akurat
+        daripada tracking di frontend (tidak bisa "lupa" ke-fire, dan
+        tidak gampang dipalsukan lewat DevTools/extension).
+      - Titik pencatatan: SETELAH Turnstile + validasi url/platform
+        lolos, TAPI SEBELUM memanggil backend pihak ketiga
+        (ttdl/igdl/pindl) -> jadi yang terhitung adalah percobaan yang
+        sudah pasti captcha-nya valid & link-nya format platform yang
+        benar, tidak peduli link-nya nanti berhasil diproses atau
+        tidak (video privat, backend pihak ketiga lagi down, dst tetap
+        dihitung sebagai "orang yang nyoba").
+      - Storage: pakai Cloudflare D1 (SQLite di edge, binding `DB` di
+        wrangler.toml) -> bukan KV, karena KV dibatasi ~1000 write/hari
+        di free tier yang gampang habis untuk tracking klik, sedangkan
+        D1 jauh lebih longgar (100rb write/hari di free tier) dan bisa
+        query agregat (GROUP BY, COUNT DISTINCT) langsung lewat SQL.
+      - Pencatatan (trackClickEvent) dijalankan lewat
+        `c.executionCtx.waitUntil(...)` -> supaya proses INSERT ke D1
+        tidak memperlambat response ke user sama sekali (user tidak
+        perlu menunggu tracking selesai dulu baru dapat hasil download).
+      - Kalau binding DB belum di-set di Worker (lupa setup), tracking
+        otomatis dilewati dengan console.warn (BUKAN bikin seluruh
+        /api/download gagal) -> supaya fitur intinya (download) tidak
+        pernah terganggu gara-gara fitur tracking yang notabene cuma
+        pelengkap.
+      - Endpoint baru GET /api/stats: mengembalikan rekap total klik,
+        breakdown per platform, perkiraan pengguna unik (COUNT DISTINCT
+        IP), dan tren harian -> dipakai oleh /dashboard.
+      - Endpoint baru GET /dashboard: halaman HTML sederhana (inline,
+        tidak perlu Workers Sites/Assets) yang menampilkan angka-angka
+        di atas plus grafik tren harian. Bisa dikunci pakai query
+        `?key=...` yang dicocokkan ke secret Worker DASHBOARD_ACCESS_KEY
+        (opsional) -> kalau secret itu belum di-set, dashboard tetap
+        bisa diakses siapa saja yang tahu URL-nya (cukup aman untuk data
+        sekadar hitungan klik, tapi tetap disarankan di-set untuk
+        produksi supaya tidak sembarang orang bisa lihat traffic).
+      - Setup yang WAJIB dilakukan supaya fitur ini aktif:
+        1. `wrangler d1 create ttsaveig-tracking` -> catat database_id
+           yang muncul.
+        2. Tambahkan binding di wrangler.toml:
+           [[d1_databases]]
+           binding = "DB"
+           database_name = "ttsaveig-tracking"
+           database_id = "<database_id dari langkah 1>"
+        3. Jalankan schema.sql (file terpisah, lihat folder project)
+           lewat: `wrangler d1 execute ttsaveig-tracking --file=./schema.sql`
+           (tambahkan --remote kalau mau langsung ke database production,
+           bukan cuma lokal).
+        4. (Opsional) `wrangler secret put DASHBOARD_ACCESS_KEY` untuk
+           mengunci /dashboard dan /api/stats dengan sebuah kunci akses.
 ========================================================= */
 
 const app = new Hono();
@@ -335,6 +393,237 @@ const downloadLimiter = createRateLimiter({
 
 // ---------- Health check ----------
 app.get('/health', (c) => c.text('OK', 200));
+
+// ---------- Tracking klik per platform (D1) — lihat poin 14 ----------
+// Dicatat lewat waitUntil() supaya tidak menunda response /api/download
+// sedikit pun. Kalau binding DB belum ada, cuma warning di log — tidak
+// pernah menggagalkan proses download itu sendiri.
+async function trackClickEvent(c, platform) {
+  if (!c.env.DB) {
+    console.warn('[tracking] binding D1 "DB" belum di-set -> klik tidak dicatat.');
+    return;
+  }
+  const ip =
+    c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown';
+
+  try {
+    await c.env.DB.prepare(
+      'INSERT INTO click_events (platform, ip) VALUES (?1, ?2)'
+    )
+      .bind(platform, ip)
+      .run();
+  } catch (err) {
+    console.error('[tracking] gagal menyimpan click event:', err);
+  }
+}
+
+// Cek kunci akses opsional untuk /dashboard & /api/stats. Kalau secret
+// DASHBOARD_ACCESS_KEY belum di-set di Worker, endpoint tetap terbuka
+// (cukup aman untuk sekadar data hitungan klik, tapi disarankan di-set
+// untuk produksi lewat: wrangler secret put DASHBOARD_ACCESS_KEY).
+function isDashboardAuthorized(c) {
+  const requiredKey = c.env.DASHBOARD_ACCESS_KEY;
+  if (!requiredKey) return true;
+  const providedKey = c.req.query('key') || c.req.header('x-dashboard-key');
+  return providedKey === requiredKey;
+}
+
+// Endpoint statistik: total klik, breakdown per platform, perkiraan
+// pengguna unik (COUNT DISTINCT ip), dan tren harian.
+app.get('/api/stats', async (c) => {
+  if (!isDashboardAuthorized(c)) {
+    return c.json({ success: false, message: 'Akses ditolak. Kunci akses salah/tidak ada.' }, 403);
+  }
+  if (!c.env.DB) {
+    return c.json(
+      { success: false, message: 'Tracking belum dikonfigurasi (binding D1 "DB" kosong).' },
+      500
+    );
+  }
+
+  try {
+    const totalsResult = await c.env.DB.prepare(
+      `SELECT platform, COUNT(*) as count, COUNT(DISTINCT ip) as unique_ip
+       FROM click_events
+       GROUP BY platform`
+    ).all();
+
+    const totals = { tiktok: 0, instagram: 0, pinterest: 0 };
+    const uniqueVisitorsApprox = { tiktok: 0, instagram: 0, pinterest: 0 };
+    let totalClicks = 0;
+
+    for (const row of totalsResult.results || []) {
+      if (totals[row.platform] !== undefined) {
+        totals[row.platform] = row.count;
+        uniqueVisitorsApprox[row.platform] = row.unique_ip;
+        totalClicks += row.count;
+      }
+    }
+
+    const dailyResult = await c.env.DB.prepare(
+      `SELECT substr(created_at, 1, 10) as day, platform, COUNT(*) as count
+       FROM click_events
+       GROUP BY day, platform
+       ORDER BY day ASC`
+    ).all();
+
+    const byDay = {};
+    for (const row of dailyResult.results || []) {
+      byDay[row.day] = byDay[row.day] || { tiktok: 0, instagram: 0, pinterest: 0 };
+      if (byDay[row.day][row.platform] !== undefined) {
+        byDay[row.day][row.platform] = row.count;
+      }
+    }
+    const dailySeries = Object.keys(byDay)
+      .sort()
+      .map((day) => ({ day, ...byDay[day] }));
+
+    return c.json({ success: true, totalClicks, totals, uniqueVisitorsApprox, dailySeries });
+  } catch (err) {
+    console.error('[/api/stats] error:', err);
+    return c.json({ success: false, message: 'Gagal mengambil statistik dari database.' }, 500);
+  }
+});
+
+// Halaman dashboard sederhana — inline HTML (tidak butuh Workers
+// Sites/Assets), memanggil /api/stats via fetch relatif (same-origin,
+// jadi tidak kena isu CORS).
+app.get('/dashboard', (c) => {
+  if (!isDashboardAuthorized(c)) {
+    return c.text('Akses ditolak. Tambahkan ?key=<kunci akses yang benar> di URL.', 403);
+  }
+
+  const dashboardKeyQuery = c.req.query('key')
+    ? `?key=${encodeURIComponent(c.req.query('key'))}`
+    : '';
+
+  const html = `<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<title>Reelgrab — Dashboard Tracking</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0b0d12; --card: #151822; --text: #f2f3f5; --muted: #9aa0ac;
+    --border: #262a35;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); padding: 32px 24px 64px;
+  }
+  h1 { font-size: 24px; margin-bottom: 4px; }
+  .sub { color: var(--muted); margin-bottom: 32px; font-size: 14px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 32px; max-width: 1000px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
+  .card .label { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+  .card .value { font-size: 32px; font-weight: 700; }
+  .card .sub-value { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; }
+  .chart-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 24px; max-width: 1000px; }
+  .refresh { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; margin-bottom: 24px; }
+  .refresh:hover { border-color: #444; }
+  .loading { color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+  <h1>📊 Dashboard Tracking Reelgrab</h1>
+  <div class="sub">Jumlah orang yang klik tombol "Ambil Video/Gambar" per platform</div>
+
+  <button class="refresh" onclick="loadStats()">↻ Refresh data</button>
+
+  <div id="loading" class="loading">Memuat data...</div>
+  <div class="cards" id="cards" style="display:none;"></div>
+  <div class="chart-wrap" id="chartWrap" style="display:none;">
+    <canvas id="dailyChart" height="90"></canvas>
+  </div>
+
+  <script>
+    const STATS_URL = '/api/stats${dashboardKeyQuery}';
+    const PLATFORM_META = {
+      tiktok: { label: 'TikTok', color: '#25f4ee' },
+      instagram: { label: 'Instagram', color: '#e1306c' },
+      pinterest: { label: 'Pinterest', color: '#e60023' }
+    };
+    let chartInstance = null;
+
+    async function loadStats() {
+      document.getElementById('loading').style.display = 'block';
+      try {
+        const res = await fetch(STATS_URL);
+        const data = await res.json();
+        if (!data.success) throw new Error(data.message || 'Gagal mengambil data');
+        renderCards(data);
+        renderChart(data.dailySeries);
+      } catch (err) {
+        document.getElementById('loading').textContent = 'Gagal memuat data: ' + err.message;
+        return;
+      }
+      document.getElementById('loading').style.display = 'none';
+      document.getElementById('cards').style.display = 'grid';
+      document.getElementById('chartWrap').style.display = 'block';
+    }
+
+    function renderCards(data) {
+      const cardsEl = document.getElementById('cards');
+      cardsEl.innerHTML = \`
+        <div class="card">
+          <div class="label">Total Klik (semua platform)</div>
+          <div class="value">\${data.totalClicks}</div>
+        </div>
+      \`;
+      for (const key of Object.keys(PLATFORM_META)) {
+        const meta = PLATFORM_META[key];
+        const count = data.totals[key] || 0;
+        const unique = data.uniqueVisitorsApprox[key] || 0;
+        cardsEl.innerHTML += \`
+          <div class="card">
+            <div class="label"><span class="dot" style="background:\${meta.color}"></span>\${meta.label}</div>
+            <div class="value">\${count}</div>
+            <div class="sub-value">≈ \${unique} pengguna unik (berdasarkan IP)</div>
+          </div>
+        \`;
+      }
+    }
+
+    function renderChart(dailySeries) {
+      const ctx = document.getElementById('dailyChart').getContext('2d');
+      const labels = dailySeries.map((d) => d.day);
+      const datasets = Object.keys(PLATFORM_META).map((key) => ({
+        label: PLATFORM_META[key].label,
+        data: dailySeries.map((d) => d[key] || 0),
+        borderColor: PLATFORM_META[key].color,
+        backgroundColor: PLATFORM_META[key].color + '33',
+        tension: 0.3,
+        fill: true
+      }));
+      if (chartInstance) chartInstance.destroy();
+      chartInstance = new Chart(ctx, {
+        type: 'line',
+        data: { labels, datasets },
+        options: {
+          responsive: true,
+          plugins: {
+            legend: { labels: { color: '#f2f3f5' } },
+            title: { display: true, text: 'Klik per hari per platform', color: '#f2f3f5' }
+          },
+          scales: {
+            x: { ticks: { color: '#9aa0ac' }, grid: { color: '#262a35' } },
+            y: { ticks: { color: '#9aa0ac' }, grid: { color: '#262a35' }, beginAtZero: true }
+          }
+        }
+      });
+    }
+
+    loadStats();
+  </script>
+</body>
+</html>`;
+
+  return c.html(html);
+});
 
 // ---------- Klien backend (pengganti btch-downloader) ----------
 // Persis pola yang dipakai versi browser resmi btch-downloader:
@@ -1166,6 +1455,13 @@ app.post('/api/download', downloadLimiter, async (c) => {
       400
     );
   }
+
+  // ---------- Catat klik (lihat poin 14) ----------
+  // Sampai titik ini: captcha valid, url & platform format-nya benar ->
+  // dihitung sebagai "orang yang nyoba" tombol Ambil Video/Gambar,
+  // terlepas dari hasil akhirnya nanti sukses atau gagal diproses.
+  // Dijalankan via waitUntil supaya tidak menunda response sedikit pun.
+  c.executionCtx.waitUntil(trackClickEvent(c, platform));
 
   const wantAudioOnly = quality === 'audio';
 
