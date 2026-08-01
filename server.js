@@ -503,7 +503,7 @@ app.get('/dashboard', (c) => {
 <meta charset="UTF-8" />
 <title>Reelgrab — Dashboard Tracking</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <style>
   :root {
     --bg: #0b0d12; --card: #151822; --text: #f2f3f5; --muted: #9aa0ac;
