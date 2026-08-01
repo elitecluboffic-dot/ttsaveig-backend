@@ -5,5 +5,12 @@
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
     "ALLOWED_ORIGIN": "https://telehub.web.id"
-  }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ttsaveig-tracking",
+      "database_id": "b7a18390-0e80-4595-a055-215e1c11c03e"
+    }
+  ]
 }
