@@ -300,6 +300,36 @@ import { cors } from 'hono/cors';
       - Chart.js tetap di-load dari cdn.jsdelivr.net (bukan
         cdnjs.cloudflare.com) karena cdnjs sempat diblokir di jaringan
         sebagian user -> jsDelivr terbukti lebih reliable diakses.
+
+   16) TRACKING USER-AGENT (INFO DEVICE/BROWSER) PER KLIK (update ini):
+      - Kebutuhan: selain platform, ip, dan waktu, sekarang klik juga
+        dicatat beserta header `User-Agent` mentah dari request ->
+        supaya nanti bisa dilihat klik itu datang dari device/browser
+        apa (mis. "iPhone Safari", "Android Chrome", dst.) lewat query
+        manual di D1 console.
+      - trackClickEvent() sekarang membaca header `user-agent` dari
+        request dan menyimpannya di kolom baru `user_agent` pada tabel
+        `click_events`.
+      - PENTING — WAJIB DIJALANKAN DULU DI D1 SEBELUM DEPLOY INI:
+        kolom `user_agent` BELUM ADA di schema.sql yang lama, jadi
+        harus ditambahkan manual dulu ke database yang sudah jalan
+        (ALTER TABLE tidak bisa lewat CREATE TABLE IF NOT EXISTS karena
+        tabelnya sudah ada). Jalankan salah satu dari console D1
+        (Cloudflare Dashboard) atau via wrangler:
+          ALTER TABLE click_events ADD COLUMN user_agent TEXT;
+        Kalau kolom ini belum ada saat kode ini di-deploy, INSERT di
+        trackClickEvent() akan gagal (error "no such column" akan
+        muncul di log/wrangler tail) -> tapi karena dipanggil lewat
+        waitUntil() dan dibungkus try/catch, ini TIDAK menggagalkan
+        response /api/download ke user, cuma klik tidak tercatat
+        sampai kolomnya ditambahkan.
+      - Tidak ada perubahan pada endpoint /api/stats atau /dashboard di
+        update ini -> keduanya masih cuma menampilkan agregat
+        platform/ip seperti sebelumnya. Untuk melihat detail per user
+        (ip + device), query manual langsung ke tabel click_events di
+        D1 console, contoh:
+          SELECT platform, ip, user_agent, created_at
+          FROM click_events ORDER BY created_at DESC;
 ========================================================= */
 
 const app = new Hono();
@@ -365,7 +395,7 @@ const downloadLimiter = createRateLimiter({
 // ---------- Health check ----------
 app.get('/health', (c) => c.text('OK', 200));
 
-// ---------- Tracking klik per platform (D1) — lihat poin 14 ----------
+// ---------- Tracking klik per platform (D1) — lihat poin 14 & 16 ----------
 // Dicatat lewat waitUntil() supaya tidak menunda response /api/download
 // sedikit pun. Kalau binding DB belum ada, cuma warning di log — tidak
 // pernah menggagalkan proses download itu sendiri.
@@ -376,12 +406,18 @@ async function trackClickEvent(c, platform) {
   }
   const ip =
     c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown';
+  // Header User-Agent mentah dari browser -> lihat poin 16. Kolom ini
+  // WAJIB sudah ada di tabel click_events (ALTER TABLE ADD COLUMN
+  // user_agent TEXT) sebelum kode ini deploy, kalau belum, INSERT di
+  // bawah akan gagal (tapi ditangkap try/catch, tidak menggagalkan
+  // response /api/download ke user).
+  const userAgent = c.req.header('user-agent') || 'unknown';
 
   try {
     await c.env.DB.prepare(
-      'INSERT INTO click_events (platform, ip) VALUES (?1, ?2)'
+      'INSERT INTO click_events (platform, ip, user_agent) VALUES (?1, ?2, ?3)'
     )
-      .bind(platform, ip)
+      .bind(platform, ip, userAgent)
       .run();
   } catch (err) {
     console.error('[tracking] gagal menyimpan click event:', err);
@@ -1722,7 +1758,7 @@ app.post('/api/download', downloadLimiter, async (c) => {
     );
   }
 
-  // ---------- Catat klik (lihat poin 14) ----------
+  // ---------- Catat klik (lihat poin 14 & 16) ----------
   // Sampai titik ini: captcha valid, url & platform format-nya benar ->
   // dihitung sebagai "orang yang nyoba" tombol Ambil Video/Gambar,
   // terlepas dari hasil akhirnya nanti sukses atau gagal diproses.
